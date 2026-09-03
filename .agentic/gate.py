@@ -135,6 +135,7 @@ class Repo:
             out = self.git("diff", "--cached", "--name-only", "--diff-filter=ACMR")
             return sorted(f for f in out.splitlines() if f.strip()), "staged"
         mb = self.merge_base(base)
+        mode = "no base resolvable: whole tree"
         if mb:
             out = self.git("diff", "--name-only", "--diff-filter=ACMR", mb)
             untracked = self.git("ls-files", "--others", "--exclude-standard")
@@ -142,11 +143,11 @@ class Repo:
             head = self.git("rev-parse", "HEAD").strip()
             if files or mb != head:
                 return files, f"diff vs merge-base {mb[:10]} ({base})"
-            # clean tree sitting on the base branch itself: nothing changed, so audit everything
+            mode = f"clean tree on {base} itself: whole-tree audit"
         tracked = self.git("ls-files")
         untracked = self.git("ls-files", "--others", "--exclude-standard")
         files = set(tracked.splitlines()) | set(untracked.splitlines())
-        return sorted(f for f in files if f.strip()), "no base resolvable: whole tree"
+        return sorted(f for f in files if f.strip()), mode
 
     def added_lines(self, base: str | None, staged: bool, files: list[str]) -> dict[str, list[tuple[int, str]]]:
         """file -> [(line_no, text)] of ADDED lines. Falls back to full content when no diff base."""
