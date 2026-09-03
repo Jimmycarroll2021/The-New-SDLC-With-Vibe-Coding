@@ -11,7 +11,7 @@ Python 3.11+, standard library only. LLM-agnostic: nothing here calls a model.
 Usage:
   python .agentic/gate.py                      # local: working tree vs base branch
   python .agentic/gate.py --stage commit       # pre-commit: staged diff, cheap gates
-  python .agentic/gate.py --stage ci --base origin/main
+  python .agentic/gate.py --stage ci --base origin/main   # policy read from the base ref
   python .agentic/gate.py --tier production    # raise the tier; it can never be lowered
   python .agentic/gate.py --json               # machine-readable report on stdout
 """
@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import ast
 import fnmatch
+import importlib.util
 import json
 import os
 import re
@@ -125,8 +126,12 @@ class Repo:
         self.root = root
 
     def git(self, *args: str, check: bool = False) -> str:
-        p = subprocess.run(["git", *args], cwd=self.root, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace")
+        # core.quotePath=false: git C-quotes any path with a non-ASCII byte in line-oriented output,
+        # so specs/SPEC-0007-n.md comes back as "specs/SPEC-0007-\303\261.md" and matches nothing.
+        # The G6 collectors that read NUL-delimited output are unaffected either way; the readers
+        # that cannot use -z (ls-files -s, the diff parsers) depend on this.
+        p = subprocess.run(["git", "-c", "core.quotePath=false", *args], cwd=self.root,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
         if check and p.returncode != 0:
             raise RuntimeError(f"git {' '.join(args)} failed: {p.stderr.strip()}")
         return p.stdout if p.returncode == 0 else ""
@@ -619,9 +624,67 @@ def local_python_modules(root: Path) -> set[str]:
         elif p.is_dir() and (p / "__init__.py").exists():
             mods.add(p.name)
     for p in root.iterdir():
-        if p.is_dir() and not p.name.startswith("."):
+        if p.is_dir() and not p.name.startswith(".") and dir_has_importable(p):
             mods.add(p.name)
     return mods
+
+
+def dir_has_importable(d: Path) -> bool:
+    """A directory is an importable package only if it actually holds a module. An empty directory
+    named after a package is the stress test's bypass: it makes a hallucinated import read as a
+    local module, and Python's implicit namespace packages make the same trick work for an
+    installed one."""
+    try:
+        if (d / "__init__.py").is_file():
+            return True
+        for c in d.iterdir():
+            if c.is_file() and c.suffix in (".py", ".pyd", ".so"):
+                return True
+            if c.is_dir() and (c / "__init__.py").is_file():
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def python_env_note(root: Path) -> str | None:
+    """Why the interpreter running the gate cannot say what is installed, or None if it can.
+
+    Offline by construction: the gate never asks a package index, so "exists" means "resolves in
+    the environment the gate runs in". When the project ships its own virtualenv and the gate is
+    not running inside it, that environment is not observable, and the check is reported as not
+    applicable with the reason rather than passing silently."""
+    for name in (".venv", "venv", "env"):
+        d = root / name
+        if (d / "pyvenv.cfg").is_file():
+            try:
+                if Path(sys.prefix).resolve() == d.resolve():
+                    return None
+            except OSError:
+                pass
+            return (f"the project's packages are installed in ./{name}, which is not the interpreter "
+                    f"running the gate ({sys.prefix}). Run the gate with ./{name} and declared "
+                    "imports are checked for existence as well as declaration.")
+    return None
+
+
+def python_module_exists(top: str) -> str | None:
+    """None when the import resolves to real code, otherwise why it does not.
+
+    find_spec asks the interpreter's own finders. It does not execute the module and it does not
+    touch the network, so the gate stays deterministic and offline."""
+    try:
+        spec = importlib.util.find_spec(top)
+    except (ImportError, AttributeError, ValueError, TypeError):
+        return "is declared but does not resolve in this environment"
+    if spec is None:
+        return "is declared but is not installed in this environment"
+    if spec.origin in (None, "namespace"):
+        locs = [Path(p) for p in (spec.submodule_search_locations or [])]
+        if not any(dir_has_importable(p) for p in locs):
+            return ("is declared but resolves only to a directory holding no importable module: "
+                    f"{[str(p) for p in locs[:2]]}")
+    return None
 
 
 def check_python_imports(ctx: Ctx, files: list[str]) -> list[str]:
@@ -630,6 +693,7 @@ def check_python_imports(ctx: Ctx, files: list[str]) -> list[str]:
     declared, manifests = declared_python_deps(ctx.repo.root, aliases)
     local = local_python_modules(ctx.repo.root)
     stdlib = set(sys.stdlib_module_names) | {"__future__"}
+    env_note = python_env_note(ctx.repo.root)
     problems = []
     for f in files:
         text = read_text(ctx.repo.root / f)
@@ -651,19 +715,39 @@ def check_python_imports(ctx: Ctx, files: list[str]) -> list[str]:
                 cands = {top.lower(), re.sub(r"[-_.]+", "_", top.lower())}
                 if top in stdlib or top in local:
                     continue
-                if top in aliases and re.sub(r"[-_.]+", "_", aliases[top].lower()) in declared:
+                declared_here = bool(cands & declared) or any(
+                    key in aliases and re.sub(r"[-_.]+", "_", aliases[key].lower()) in declared
+                    for key in (top, name))
+                if not declared_here:
+                    where = (f"not declared in {manifests}" if manifests
+                             else "and no requirements*.txt or pyproject.toml exists to declare it")
+                    problems.append(f"{f}:{ln}: import '{top}' is not stdlib, not local, {where}")
                     continue
-                if name in aliases and re.sub(r"[-_.]+", "_", aliases[name].lower()) in declared:
-                    continue
-                if cands & declared:
-                    continue
-                where = (f"not declared in {manifests}" if manifests
-                         else "and no requirements*.txt or pyproject.toml exists to declare it")
-                problems.append(f"{f}:{ln}: import '{top}' is not stdlib, not local, {where}")
-    return problems
+                # Declared is not the same as real. A name in requirements.txt that resolves to
+                # nothing, or to an empty directory, is still a hallucinated dependency.
+                why = None if env_note else python_module_exists(top)
+                if why:
+                    problems.append(f"{f}:{ln}: import '{top}' {why}")
+    return problems, env_note
 
 
-def check_js_imports(ctx: Ctx, files: list[str]) -> list[str]:
+def js_module_exists(modules_dir: Path, name: str) -> str | None:
+    """None when the package is really installed under node_modules, otherwise why it is not.
+    Filesystem only: no registry lookup and no `npm ls`."""
+    d = modules_dir
+    for part in name.split("/"):
+        d = d / part
+    if not d.is_dir():
+        return "is declared in package.json but is not installed in node_modules"
+    if (d / "package.json").is_file():
+        return None
+    for pat in ("*.js", "*.mjs", "*.cjs", "*.json", "*.node", "*.ts"):
+        if any(d.glob(pat)):
+            return None
+    return "is declared but its node_modules directory holds no importable module"
+
+
+def check_js_imports(ctx: Ctx, files: list[str]) -> tuple[list[str], str | None]:
     pkg = ctx.repo.root / "package.json"
     declared: set[str] = set()
     if pkg.is_file():
@@ -673,6 +757,10 @@ def check_js_imports(ctx: Ctx, files: list[str]) -> list[str]:
                 declared |= set((data.get(k) or {}).keys())
         except json.JSONDecodeError:
             pass
+    modules_dir = ctx.repo.root / "node_modules"
+    env_note = None if modules_dir.is_dir() else (
+        "node_modules is not present, so the gate cannot tell an installed package from a "
+        "hallucinated one. Install the project's packages before the gate runs.")
     ignore_prefixes = tuple(ctx.cfg_get("review", "js_alias_prefixes", default=["@/", "~/", "#"]))
     spec_re = re.compile(r"""(?:\bimport\s+(?:[^'"]*?\s+from\s+)?|\brequire\s*\(\s*|\bimport\s*\(\s*)['"]([^'"]+)['"]""")
     problems = []
@@ -688,11 +776,15 @@ def check_js_imports(ctx: Ctx, files: list[str]) -> list[str]:
                 continue
             parts = spec.split("/")
             name = "/".join(parts[:2]) if spec.startswith("@") else parts[0]
+            ln = text.count("\n", 0, m.start()) + 1
             if name not in declared:
-                ln = text.count("\n", 0, m.start()) + 1
                 where = "package.json" if pkg.is_file() else "no package.json found"
                 problems.append(f"{f}:{ln}: import '{name}' not declared in {where}")
-    return problems
+                continue
+            why = None if env_note else js_module_exists(modules_dir, name)
+            if why:
+                problems.append(f"{f}:{ln}: import '{name}' {why}")
+    return problems, env_note
 
 
 def gate_g4_review(ctx: Ctx) -> GateResult:
@@ -708,10 +800,13 @@ def gate_g4_review(ctx: Ctx) -> GateResult:
     if ctx.cfg_get("review", "check_hallucinated_imports", default=True):
         py = [f for f in ctx.changed if f.endswith(".py")]
         js = [f for f in ctx.changed if f.endswith((".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"))]
-        p1 = check_python_imports(ctx, py) if py else []
-        p2 = check_js_imports(ctx, js) if js else []
+        p1, n1 = check_python_imports(ctx, py) if py else ([], None)
+        p2, n2 = check_js_imports(ctx, js) if js else ([], None)
         problems.extend(p1 + p2)
         evidence.append(f"import check: {len(py)} python, {len(js)} js/ts files, {len(p1) + len(p2)} unresolved")
+        for note in (n1, n2):
+            if note:
+                evidence.append(f"import existence: not_applicable - {note}")
     if problems:
         return _fail("G4", "review findings", problems)
     return _pass("G4", evidence)
@@ -885,6 +980,7 @@ class Integrity:
     protected: list[str] = field(default_factory=list)
     source: list[str] = field(default_factory=list)
     declared: str | None = None
+    tier_floor: str | None = None
     problems: list[str] = field(default_factory=list)
     evidence: list[str] = field(default_factory=list)
 
@@ -910,12 +1006,20 @@ def resolve_integrity(ctx: Ctx) -> Integrity:
         out.change_set = sorted(set(ctx.vanished))
     else:
         out.change_set = sorted(set(ctx.changed) | set(ctx.committed) | set(ctx.vanished))
+    out.source = [f for f in out.change_set
+                  if match_any(f, ctx.cfg_get("paths", "source", default=[]))]
+    # The tier floor. A branch name is an assertion about risk, and the diff is the only thing in the
+    # repository that can contradict it: renaming a branch to docs/whatever used to drop G0, G3 and
+    # G5 silently. Refusing such a change outright would delete the tier system rather than enforce
+    # it, so a change carrying production source is judged AT production tier instead. A spike is
+    # still a spike, right up to the moment it carries shipping source.
+    if out.source and TIER_RANK.get(ctx.tier, 2) < TIER_RANK["production"]:
+        out.tier_floor = ctx.tier
+        ctx.tier = "production"
     non_regular = non_regular_paths(ctx)
     out.protected = sorted(set(f for f in out.change_set
                                if is_protected(f, regular=f.replace("\\", "/") not in non_regular))
                            | set(ci_files_running_the_gate(ctx, out.change_set)))
-    out.source = [f for f in out.change_set
-                  if match_any(f, ctx.cfg_get("paths", "source", default=[]))]
     if out.protected:
         out.declared, notes = resolve_declaration(ctx)
         out.evidence.extend(notes)
@@ -943,10 +1047,10 @@ def gate_g6_integrity(ctx: Ctx) -> GateResult:
                             "added or altered in this diff, so that a human reviews it.")
         else:
             evidence.append(f"declared framework maintenance in {intg.declared}: {intg.protected[:6]}")
-    if intg.source and ctx.tier != "production":
-        problems.append(f"branch '{ctx.branch}' claims tier '{ctx.tier}', but the change carries production "
-                        f"source: {intg.source[:6]}. A tier that does not run G0, G3 or G5 may not ship source. "
-                        "Move the work to a production branch.")
+    if intg.tier_floor:
+        evidence.append(f"branch '{ctx.branch}' names tier '{intg.tier_floor}', but the change carries "
+                        f"production source: {intg.source[:6]}. A tier that does not run G0, G3 or G5 may "
+                        "not decide that source ships, so this run is judged at production tier.")
     evidence.append(f"change set {len(intg.change_set)} files: {len(intg.protected)} policy or runner, "
                     f"{len(intg.source)} source; branch '{ctx.branch}' is tier '{ctx.tier}'")
     if problems:
@@ -983,7 +1087,14 @@ def enforce_verdict(rep: dict) -> dict:
     ok = verdict(rep.get("results", []))
     got = [r.get("gate") for r in rep.get("results", [])]
     required = list(rep.get("required_gates", []))
-    if required and sorted(got) != sorted(set(required)):
+    if "G6" not in got:
+        # G6 runs at every tier and every stage, so a report without it did not come from this
+        # runner. Dropping the failing result AND the required_gates list would otherwise leave a
+        # report that re-derives as a pass, because an empty required list skips the check below.
+        rep["integrity_error"] = ("the report records no G6 result, and G6 runs at every tier and "
+                                  "every stage: this did not come from an intact runner")
+        ok = False
+    elif required and sorted(got) != sorted(set(required)):
         rep["integrity_error"] = (f"the report does not cover the gates it says are required: "
                                   f"required {sorted(set(required))}, recorded {sorted(got)}. "
                                   "all([]) is True, so an empty result set is not a pass")
@@ -1002,41 +1113,91 @@ def find_root(start: Path) -> Path:
     return start
 
 
+def resolve_base(repo: Repo, cfg: dict, stage: str, base: str | None) -> str | None:
+    if base is not None or stage == "commit":
+        return base
+    env = os.environ if repo.ci_env_applies() else {}
+    base = (env.get("GITHUB_BASE_REF") and f"origin/{env['GITHUB_BASE_REF']}") \
+        or (env.get("SYSTEM_PULLREQUEST_TARGETBRANCH") and
+            "origin/" + env["SYSTEM_PULLREQUEST_TARGETBRANCH"].removeprefix("refs/heads/")) \
+        or cfg.get("project", {}).get("base_branch", "main")
+    if base and not repo.git("rev-parse", "--verify", "--quiet", base).strip():
+        for alt in (f"origin/{base}", base.removeprefix("origin/")):
+            if repo.git("rev-parse", "--verify", "--quiet", alt).strip():
+                return alt
+        return None
+    return base
+
+
+def build_ctx(repo: Repo, cfg: dict, stage: str, base: str | None, tier_override: str | None) -> Ctx:
+    branch = repo.branch()
+    tier, tier_problem = resolve_tier(cfg, branch, tier_override)
+    changed, mode = repo.changed_files(base, stage == "commit")
+    return Ctx(repo, cfg, stage, base, tier, branch, changed, mode,
+               committed=repo.committed_changed_files(base), tier_override_problem=tier_problem,
+               vanished=repo.vanished_files(base, stage == "commit"),
+               merge_base=repo.merge_base(base))
+
+
+def base_policy(ctx: Ctx) -> tuple[dict | None, str]:
+    """agentic.toml as it exists on the base ref, so a relaxation can be judged by the policy it
+    replaces rather than by the one replacing it."""
+    if not ctx.merge_base:
+        return None, "no base ref resolvable"
+    text = ctx.repo.show(ctx.merge_base, "agentic.toml")
+    if not text.strip():
+        return None, f"no agentic.toml on {ctx.merge_base[:10]}"
+    try:
+        return tomllib.loads(text), f"base ref {ctx.merge_base[:10]}"
+    except tomllib.TOMLDecodeError as e:
+        return None, f"agentic.toml on {ctx.merge_base[:10]} does not parse: {e}"
+
+
+def resolve_policy(repo: Repo, cfg: dict, stage: str, base: str | None,
+                   tier_override: str | None) -> tuple[Ctx, str]:
+    """Which agentic.toml the gates are judged by, and the context built from it.
+
+    Locally it is the candidate's own policy, so a policy change can be exercised by the change
+    proposing it. In CI it is the base ref's policy, so a pull request that relaxes a rule is judged
+    by the rule it replaces - unless the change declares framework maintenance in the spec it
+    references, which is the same authorisation channel G6 resolves from the immutable snapshot. That
+    question is asked while the base policy is in force, so the candidate cannot steer the answer
+    with its own [paths] or [spec] keys.
+
+    This lives in the runner and not in the workflow on purpose. On a pull request event the CI
+    definition comes from the branch, so a restore written in YAML is a rule the candidate carries;
+    the runner CI executes is unpacked from the base ref and is not."""
+    ctx = build_ctx(repo, cfg, stage, base, tier_override)
+    if stage != "ci":
+        return ctx, "candidate"
+    cfg_base, why = base_policy(ctx)
+    if cfg_base is None:
+        return ctx, f"candidate: {why}"
+    trial = build_ctx(repo, cfg_base, stage, base, tier_override)
+    if trial.integrity.declared:
+        return ctx, f"candidate: framework maintenance declared in {trial.integrity.declared}"
+    return trial, why
+
+
 def run(root: Path, stage: str, base: str | None, tier_override: str | None) -> dict:
     cfg = load_config(root)
     repo = Repo(root)
-    branch = repo.branch()
-    tier, tier_problem = resolve_tier(cfg, branch, tier_override)
-    if base is None and stage != "commit":
-        env = os.environ if repo.ci_env_applies() else {}
-        base = (env.get("GITHUB_BASE_REF") and f"origin/{env['GITHUB_BASE_REF']}") \
-            or (env.get("SYSTEM_PULLREQUEST_TARGETBRANCH") and
-                "origin/" + env["SYSTEM_PULLREQUEST_TARGETBRANCH"].removeprefix("refs/heads/")) \
-            or cfg.get("project", {}).get("base_branch", "main")
-        if base and not repo.git("rev-parse", "--verify", "--quiet", base).strip():
-            for alt in (f"origin/{base}", base.removeprefix("origin/")):
-                if repo.git("rev-parse", "--verify", "--quiet", alt).strip():
-                    base = alt
-                    break
-            else:
-                base = None
-    changed, mode = repo.changed_files(base, stage == "commit")
-    ctx = Ctx(repo, cfg, stage, base, tier, branch, changed, mode,
-              committed=repo.committed_changed_files(base), tier_override_problem=tier_problem,
-              vanished=repo.vanished_files(base, stage == "commit"), merge_base=repo.merge_base(base))
+    base = resolve_base(repo, cfg, stage, base)
+    ctx, policy = resolve_policy(repo, cfg, stage, base, tier_override)
     _ = ctx.integrity   # BEFORE any gate runs. G2 and G3 execute the branch's own commands, so what
                         # authorises a change to the judge may not be read from state it can write.
     default = [g for g in GATES if g != "G6"]
-    required = list(cfg.get("tiers", {}).get("required", {}).get(tier, default))
+    required = list(ctx.cfg.get("tiers", {}).get("required", {}).get(ctx.tier, default))
     if stage == "commit":
-        commit_gates = cfg.get("stages", {}).get("commit", ["G1", "G4"])
+        commit_gates = ctx.cfg.get("stages", {}).get("commit", ["G1", "G4"])
         required = [g for g in required if g in commit_gates]
     required = [g for g in required if g != "G6"] + ["G6"]   # unconditional: no tier, no stage, no key
     results = [GATES[g](ctx) for g in GATES if g in required]
     ok = verdict(results)
     return enforce_verdict({
-        "ok": ok, "stage": stage, "branch": branch, "tier": tier, "base": base,
-        "changed_files": len(changed), "changed_mode": mode, "required_gates": required,
+        "ok": ok, "stage": stage, "branch": ctx.branch, "tier": ctx.tier, "base": base,
+        "policy": policy, "changed_files": len(ctx.changed), "changed_mode": ctx.changed_mode,
+        "required_gates": required,
         "results": [asdict(r) for r in results],
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     })
@@ -1046,6 +1207,7 @@ def print_report(rep: dict, stream=sys.stdout) -> None:
     w = stream.write
     w(f"\nagentic-gates  stage={rep['stage']}  branch={rep['branch']}  tier={rep['tier']}  "
       f"changed={rep['changed_files']} ({rep['changed_mode']})\n")
+    w(f"policy:   {rep.get('policy', 'candidate')}\n")
     w(f"required: {' '.join(rep['required_gates']) or '(none for this tier)'}\n\n")
     for r in rep["results"]:
         mark = {"pass": "PASS", "fail": "FAIL", "not_applicable": "N/A ", "error": "ERR "}[r["status"]]

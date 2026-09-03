@@ -28,9 +28,9 @@ The last line is the point. A gate says pass or fail with evidence. It never say
 | **G1 context** | `AGENTS.md` missing, over the line limit, missing a section, untracked, or leaking a secret | "start with ten lines"; "treat AGENTS.md as code" |
 | **G2 tests** | source changed without a test change, or the test command fails | "tests verify the deterministic parts"; enforces tests *alongside* code (a diff cannot prove *before*) |
 | **G3 evals** | an AI-surface change scores below the bar, has too few cases, no rubric, or a stub target | "evals verify the parts that are not deterministic"; "the bar is the eval, not the demo" |
-| **G4 review** | a secret pattern in an added line, a `.env`/`.pem` in the diff, or an import that is not stdlib, local, or declared | "check imports for real packages"; the hook that blocks the hard-coded password |
+| **G4 review** | a secret pattern in an added line, a `.env`/`.pem` in the diff, or an import that is not stdlib, not local, not declared, or declared but resolving to nothing in the environment | "check imports for real packages"; the hook that blocks the hard-coded password |
 | **G5 handoff** | no `handoffs/HANDOFF-*.md` in the change, or a required field is a placeholder | "traces of every agent run"; "clear handoff protocols" |
-| **G6 integrity** | the change edits `agentic.toml`, `.agentic/` or a CI definition that runs the gate, without a spec that declares framework maintenance; a low-tier branch carries production source; `--tier` is used to lower the tier; or no base ref resolves | a control point an agent can rewrite is not a control point |
+| **G6 integrity** | the change edits `agentic.toml`, `.agentic/` or a CI definition that runs the gate, without a spec that declares framework maintenance; `--tier` is used to lower the tier; or no base ref resolves | a control point an agent can rewrite is not a control point |
 
 Which gates apply is decided by **risk tier**, derived from the branch name in `agentic.toml`:
 
@@ -45,7 +45,10 @@ Which gates apply is decided by **risk tier**, derived from the branch name in `
 cannot be switched off by editing `agentic.toml`.
 
 There is no `--skip`. If a gate should not apply, the work is on the wrong branch, and the branch
-name is checked against the diff rather than believed. `--tier` can raise the tier, never lower it.
+name is checked against the diff rather than believed: a prototype- or internal-tier branch whose
+change set touches `paths.source` is judged at production tier instead. `--tier` can raise the tier,
+never lower it. In CI the policy itself comes from the base ref, so a pull request that relaxes a
+rule is judged by the rule it replaces unless it declares framework maintenance in its spec.
 
 ## Install into a repository (five minutes)
 
@@ -135,7 +138,7 @@ AGENTS.md  CLAUDE.md  GEMINI.md  rules, and two one-line pointers to them
 specs/  handoffs/                one file per change, checked by G0 and G5
 docs/GATES.md                    what each gate checks and why
 adapters/                        optional per-tool conveniences
-tests/test_gate.py               46 tests; each builds a real temporary git repo
+tests/test_gate.py               67 tests; each builds a real temporary git repo
 ```
 
 ## What it deliberately does not do

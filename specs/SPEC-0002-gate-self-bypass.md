@@ -74,6 +74,40 @@ archive `.agentic` from the pull request's own head, call it trusted, and run th
 with every `gate.py` line byte-identical. A definition that never ran the gate is still not protected
 at all; one that did is protected in full.
 
+**In CI the policy comes from the base ref, not from the candidate.** `resolve_policy()` reads
+`agentic.toml` from the merge base at `--stage ci`, so a pull request that relaxes a rule is judged
+by the rule it replaces. The exception is the same authorising channel as the runner edit: a change
+that declares `Framework maintenance: yes` in the G0-valid spec it references, with the declaration
+in this diff, is judged by its own `agentic.toml`, so a policy change can still be exercised by the
+change proposing it. That question is answered while the base policy is in force, so a candidate
+cannot steer the answer with its own `[paths]` or `[spec]` keys, and the report carries a `policy:`
+line naming which was used. This is in the runner rather than in the workflow deliberately: on a
+`pull_request` event the CI definition comes from the branch, so a restore written in YAML is a rule
+the candidate carries, while the runner CI executes is unpacked from the base ref and is not. It is
+also why the restore is not done by overwriting the file in the working tree: that would remove
+`agentic.toml` from the working-tree change set, and G4 would stop scanning its added lines.
+
+**The tier is a floor, not a veto.** A prototype- or internal-tier branch whose change set touches
+`paths.source` is evaluated at production tier rather than refused. The first version of this change
+refused it outright; two external reviews called that "deleting the tier system" and "a blunt
+instrument", and they were right. Refusing means a repository that legitimately spikes inside its
+own source tree has no way to work, while raising the tier closes the branch-rename bypass exactly:
+the rename still buys nothing, because G0, G3 and G5 all run. `resolve_integrity()` applies the
+floor before the protected paths and the declaration are resolved, so the authorising spec is held
+to the raised tier as well.
+
+**G4 checks that a declared import exists, offline.** Gap 4 from the stress test: an import that was
+merely *declared* passed, so adding a hallucinated package to `requirements.txt` satisfied the gate,
+and so did an empty directory of the same name. Existence is now resolved with
+`importlib.util.find_spec` for Python and against the contents of `node_modules` for JS/TS. A name
+that resolves to nothing fails; so does one that resolves only to a directory holding no importable
+module, which covers both Python's implicit namespace packages and the empty-directory trick.
+`local_python_modules()` correspondingly no longer treats an arbitrary top-level directory as an
+importable module. The gate does not touch the network or a package index, so "exists" means
+"resolves in the environment the gate runs in"; where that environment is demonstrably not the
+project's - a `.venv/` the gate is not running inside, or a missing `node_modules` - the existence
+half is reported as `not_applicable` with the reason, never as a silent pass.
+
 **The verdict is recomputed from the recorded results.** `verdict()` derives the overall boolean
 from the statuses in the report, and `enforce_verdict()` re-derives it wherever a report is
 produced or consumed: at the end of `run()`, in `main()` before the report is written or printed,
@@ -111,8 +145,9 @@ matters.
 3. G6 allows that same change when the branch tier is production and a referenced spec carries a
    `Framework maintenance: yes` field, exactly that value and not a sentence containing it, and
    records which spec declared it as evidence.
-4. G6 fails when the change set touches `paths.source` and the branch tier is not production, and
-   names the branch, the tier and the offending files.
+4. A change set that touches `paths.source` on a prototype- or internal-tier branch is evaluated at
+   production tier, and G6 records the branch, the tier it named and the offending files as
+   evidence. It is not refused: the gates that the lower tier would have skipped simply run.
 5. `--tier` may raise the tier above the one the branch name implies and may not lower it. A lower
    value is ignored, the branch tier stands, and G6 fails with the attempted value.
 6. A report whose results contain a failure always carries `ok = false` and exits non-zero, even if
@@ -150,6 +185,27 @@ matters.
 19. The run-time exemption under `.agentic/` applies to regular files and directories only. A
     symlink or gitlink at an exempt path is protected, and the runner writes its report by
     create-and-replace so that it can never be written through such a link.
+20. At `--stage ci` the policy is read from the base ref, so a change that relaxes a rule is judged
+    by the rule it replaces. The report names the policy source. A change that declares framework
+    maintenance in the spec it references is judged by its own `agentic.toml` instead, and that
+    decision is taken while the base policy is in force. With no `agentic.toml` on the base ref the
+    candidate's is used and the reason is recorded, not assumed.
+21. Locally and in the hook the candidate's own policy is used, so a policy change can be worked on.
+22. A declared import must resolve in the environment the gate runs in. A name in
+    `requirements*.txt` or `package.json` that resolves to nothing fails G4, and so does one that
+    resolves only to a directory holding no importable module. A top-level directory with no module
+    in it is not a local module.
+23. Where the environment cannot be observed - the project ships a `.venv/` the gate is not running
+    inside, or `node_modules` is absent - the existence half of G4 is reported as
+    `import existence: not_applicable` with the reason. The declaration check still applies. Nothing
+    passes silently, and no check opens a socket.
+24. Paths that git C-quotes in line-oriented output, such as a spec whose filename carries an
+    accent, are read correctly: every git invocation runs with `core.quotePath=false`. A maintenance
+    declaration in `specs/SPEC-NNNN-ñ.md` authorises, and a symlink at
+    `.agentic/runs/trace-ñ.json` is still seen as a non-regular path.
+25. A report that records no G6 result is not a pass, whatever else it contains. Dropping the
+    failing result and the `required_gates` list together used to leave a report that re-derived as
+    a pass, because an empty required list skipped the coverage check.
 
 ## Out of scope
 
@@ -166,15 +222,16 @@ matters.
   outright by criterion 18, on any branch that is not the project's base branch, rather than
   degrading to a vacuous whole-tree audit. Editing the value is separately an edit to
   `agentic.toml`, so G6 fails it for that reason as well.
-- **Restoring `agentic.toml` from the base ref in CI.** The workflows restore `.agentic/` only; the
-  policy read is deliberately the branch's own, so that a policy change can be exercised by the
-  change proposing it, and the trusted G6 is what stops that change being undeclared. Whether CI
-  should instead judge a policy relaxation by the policy it replaces is a design decision for the
-  repository owner and is not made here. The documentation previously claimed the restore already
-  happened; that claim was wrong and has been corrected rather than implemented.
-- **Gap 4 from the stress test**, that G4 checks an import is declared rather than that it exists,
-  and gaps 5 and 6, hollow spec sections and obfuscated secrets. Separate specs, and gap 4 needs a
-  human decision about whether the gate is allowed to touch the network or the environment.
+- **Judging a policy relaxation by the base policy outside CI.** Locally and in the hook the
+  candidate's own `agentic.toml` is read, because that is the file the author is editing. The local
+  protection is only that G6 fails an undeclared change to it.
+- **Whether a declared package exists on a package index.** The gate resolves imports against the
+  environment it runs in and never opens a socket, so a package that exists on PyPI but is not
+  installed reads the same as one that does not exist. The cost is that a CI job which does not
+  install the project's dependencies gets a `not_applicable` or a fail rather than a judgement;
+  install them, or that half of G4 tells you nothing.
+- **Gaps 5 and 6 from the stress test**, hollow spec sections and obfuscated secrets. Separate
+  specs. Scenarios S1, S2, S5, S6, S7, S9 and S10 in the harness are still ALLOWED, by design.
 - **The CI definition itself.** On a pull request event the workflow file comes from the pull
   request head, so a change that edits or deletes it decides whether any of this runs. G6 fails such
   a change, which makes it visible, but the thing that makes the gate binding is a base branch
@@ -188,9 +245,11 @@ matters.
   is being reviewed by three models and a human rather than by itself.
 - **Merge queues.** There is no `merge_group` trigger, so a repository using a merge queue needs one
   added, and needs the trusted-runner step taught about that event.
-- **Path quoting outside G6.** The G6 collectors read NUL-delimited paths. `changed_files` and
-  `added_lines` still read line-oriented git output, which `core.quotePath` escapes for unusual
-  names. That is pre-existing and belongs in its own change.
+- **Path quoting beyond non-ASCII.** Every git call now runs with `core.quotePath=false`, which
+  covers the realistic case of an accented or CJK filename. Git still C-quotes a path containing a
+  literal double quote, a backslash or a control character, and the line-oriented readers
+  (`changed_files`, `added_lines`, `declaration_diff_paths`, `non_regular_paths`) would mis-parse
+  those. Un-escaping C-quoted paths belongs in its own change.
 - **Indirect invocation.** A CI definition that calls the runner through a wrapper script, a make
   target or a reusable workflow contains no literal `gate.py`, so G6 will not recognise it as part
   of the judge.
@@ -208,20 +267,23 @@ framework is installed. A regression here is not visible in the report it produc
 
 ## Verification
 
-- Criteria 1 to 7 and 12 to 18: `tests/test_gate.py`, classes `Integrity` and `EndToEnd`, each
-  building a real temporary git repository and asserting the failure mode and the matching pass.
+- Criteria 1 to 7, 12 to 18 and 20 to 25: `tests/test_gate.py`, classes `Integrity` and `EndToEnd`,
+  each building a real temporary git repository and asserting the failure mode and the matching
+  pass. 67 tests, one skipped (see criterion 19). Every test added for criteria 20 to 25 was run
+  against the previous runner first and observed to fail for the stated reason.
 - Criterion 19: the protection half is tested (`test_g6_treats_a_symlinked_runtime_artefact_as_
   protected`, which builds the symlink through the git index so it runs on Windows). The write half
   is tested by `test_the_report_write_does_not_follow_a_symlink`, which **skips** on a host that
   does not permit creating symlinks, which includes the Windows box this was developed on. It has
   not been executed. A Linux CI run is what confirms it.
-- Criterion 8: read by eye, plus `git checkout origin/main -- .agentic agentic.toml` exercised by
-  hand locally. Not executed in GitHub Actions or Azure Pipelines, because this branch is not
-  pushed and the private repository has no runner budget spent on it. A human must confirm the
-  first real pull request run restores and reports as intended.
+- Criterion 8: read by eye. Not executed in GitHub Actions or Azure Pipelines - neither workflow
+  file has ever run. A human must confirm the first real pull request run unpacks the trusted runner
+  and reports as intended. Criterion 20, by contrast, is executed: the policy restore lives in the
+  runner, so `tests/test_gate.py` exercises it directly at `--stage ci` without a CI service.
 - Criterion 9: `python .agentic/gate.py` on this branch, and the adversarial harness at
-  `C:\Users\j_car\gates-stress\harness.py` re-run against the changed framework, which asserts the
-  three bypass scenarios are now blocked and the 15 detections still fire.
+  `C:\Users\j_car\gates-stress\harness.py` re-run against the changed framework. Baseline green,
+  all 15 CATCH detections fire, and S3, S4, S8, S11, S12, S13 and S14 are all BLOCKED - S8 and S13
+  are the two halves of gap 4 and were ALLOWED before this change.
 - Human check: confirm the tripwire and boundary split in Architecture is a trade-off worth making,
   and decide whether `.agentic/` and `agentic.toml` should carry CODEOWNERS in repositories that
   install this framework.

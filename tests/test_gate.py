@@ -212,7 +212,7 @@ class EndToEnd(unittest.TestCase):
     def test_ci_env_vars_ignored_for_a_repo_that_is_not_the_ci_workspace(self):
         # regression: the first GitHub Actions run leaked GITHUB_REF_NAME=main into the fixtures
         self.fx.branch("proto/idea")
-        self.fx.write("src/x.py", "import os\n")
+        self.fx.write("notes/x.py", "import os\n")     # not paths.source: the tier floor is a separate test
         with mock.patch.dict(os.environ, {"GITHUB_WORKSPACE": "/home/runner/work/other", "GITHUB_REF_NAME": "main",
                                           "GITHUB_BASE_REF": "main"}):
             rep = self.fx.run()
@@ -366,9 +366,44 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("import 'totallynotapackage'", ev)
         self.assertIn("import 'yaml'", ev)                 # not declared yet
         self.assertNotIn("import 'os'", ev)
+        # gap 4: declaring it is no longer enough. The name must also resolve in this environment.
         self.fx.write("requirements.txt", "PyYAML>=6\ntotallynotapackage==1.0  # pinned\n")
-        rep = self.fx.run()
-        self.assertEqual(self.fx.result(rep, "G4")["status"], "pass", self.fx.result(rep, "G4")["evidence"])
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertEqual(g4["status"], "fail")
+        self.assertTrue(any("totallynotapackage" in e and "not installed" in e for e in g4["evidence"]),
+                        g4["evidence"])
+
+    def test_g4_rejects_an_import_that_only_an_empty_directory_makes_look_local(self):
+        """Gap 4, the second half: a directory named after the package, with no module in it, used
+        to make a hallucinated import read as a local one."""
+        self.fx.branch("proto/emptydir")
+        (self.fx.root / "quantum_billing_toolkit").mkdir()
+        self.fx.write("quantum_billing_toolkit/README.md", "vendored later\n")
+        self.fx.write("notes/fetch.py", "import quantum_billing_toolkit\n")
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertEqual(g4["status"], "fail")
+        self.assertTrue(any("quantum_billing_toolkit" in e for e in g4["evidence"]), g4["evidence"])
+
+    def test_g4_import_existence_is_not_applicable_without_the_projects_interpreter(self):
+        """Never a silent pass: when the project ships a virtualenv the gate is not running in, the
+        existence half is reported as not applicable, with the reason."""
+        self.fx.branch("proto/venv")
+        self.fx.write(".venv/pyvenv.cfg", "home = /usr/bin\n")
+        self.fx.write("requirements.txt", "totallynotapackage==1.0\n")
+        self.fx.write("notes/fetch.py", "import totallynotapackage\n")
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertEqual(g4["status"], "pass", g4["evidence"])
+        self.assertTrue(any("import existence: not_applicable" in e for e in g4["evidence"]), g4["evidence"])
+
+    def test_g4_rejects_a_js_package_whose_node_modules_entry_is_empty(self):
+        self.fx.branch("proto/js-empty")
+        self.fx.write("package.json", json.dumps({"dependencies": {"leftpad-hallucinated": "0"}}))
+        (self.fx.root / "node_modules/leftpad-hallucinated").mkdir(parents=True)
+        self.fx.write("node_modules/other/package.json", "{}")     # node_modules itself is populated
+        self.fx.write("notes/app.ts", "import x from 'leftpad-hallucinated';\n")
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertEqual(g4["status"], "fail")
+        self.assertTrue(any("no importable module" in e for e in g4["evidence"]), g4["evidence"])
 
     def test_g4_local_module_import_is_fine(self):
         self.fx.branch("proto/local")
@@ -388,7 +423,9 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("'leftpad-hallucinated'", ev)
         self.assertNotIn("'node:fs'", ev)
         self.fx.write("package.json", json.dumps({"dependencies": {"react": "^18", "@scope/pkg": "1", "leftpad-hallucinated": "0"}}))
-        self.assertEqual(self.fx.result(self.fx.run(), "G4")["status"], "pass")
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertEqual(g4["status"], "pass")
+        self.assertTrue(any("import existence: not_applicable" in e for e in g4["evidence"]), g4["evidence"])
 
     # ---- G5
     def test_g5_fails_without_handoff_or_with_placeholder(self):
@@ -532,16 +569,72 @@ class Integrity(unittest.TestCase):
         g6 = self.fx.result(self.fx.run(), "G6")
         self.assertEqual(g6["status"], "pass", g6["evidence"])
 
-    def test_g6_fails_when_a_low_tier_branch_carries_production_source(self):
+    def test_a_low_tier_branch_carrying_production_source_is_judged_at_production_tier(self):
+        """The tier floor. Renaming a branch to internal/* used to drop G0, G3 and G5 silently.
+        The change is now evaluated at production tier rather than refused, so the tier system
+        still exists for work that really is a spike."""
         self.fx.branch("internal/sneaky")
         self.fx.write("src/billing.py", "def charge(c):\n    return c * 2\n")
         self.fx.write("tests/test_billing.py", "def test_c():\n    pass\n")
         rep = self.fx.run()
-        self.assertEqual(rep["tier"], "internal")
+        self.assertEqual(rep["tier"], "production")
+        self.assertEqual([r["gate"] for r in rep["results"]], ["G0", "G1", "G2", "G3", "G4", "G5", "G6"])
         g6 = self.fx.result(rep, "G6")
-        self.assertEqual(g6["status"], "fail")
-        self.assertTrue(any("src/billing.py" in e for e in g6["evidence"]), g6["evidence"])
+        self.assertEqual(g6["status"], "pass", g6["evidence"])
+        self.assertTrue(any("src/billing.py" in e and "production tier" in e for e in g6["evidence"]),
+                        g6["evidence"])
+        self.assertEqual(self.fx.result(rep, "G0")["status"], "fail")   # the rename bought nothing
+        self.assertEqual(self.fx.result(rep, "G5")["status"], "fail")
         self.assertFalse(rep["ok"])
+
+    def test_the_tier_floor_leaves_a_branch_that_carries_no_source_alone(self):
+        self.fx.branch("proto/idea")
+        self.fx.write("notes/sketch.md", "an idea\n")
+        rep = self.fx.run()
+        self.assertEqual(rep["tier"], "prototype")
+        self.assertEqual([r["gate"] for r in rep["results"]], ["G4", "G6"])
+        self.assertTrue(rep["ok"], json.dumps(rep, indent=1))
+
+    # ---- decision (a): in CI a policy relaxation is judged by the policy it replaces
+
+    def test_ci_judges_an_undeclared_policy_relaxation_by_the_base_policy(self):
+        full_production_setup(self.fx)
+        self.fx.commit("the change")
+        toml = (self.fx.root / "agentic.toml").read_text(encoding="utf-8")
+        self.fx.write("agentic.toml", toml.replace("max_lines = 50", "max_lines = 5000"))
+        self.fx.write("AGENTS.md", GOOD_AGENTS + "x\n" * 60)   # legal under 5000, illegal under 50
+        self.fx.commit("relax the policy, then rely on the relaxation")
+        local = gate.run(self.fx.root, "local", "main", None)
+        self.assertEqual(local["policy"], "candidate")
+        self.assertEqual(self.fx.result(local, "G1")["status"], "pass")     # its own policy, locally
+        rep = gate.run(self.fx.root, "ci", "main", None)
+        self.assertIn("base ref", rep["policy"])
+        self.assertEqual(self.fx.result(rep, "G1")["status"], "fail", rep["policy"])
+        self.assertTrue(any("limit 50" in e for e in self.fx.result(rep, "G1")["evidence"]))
+        self.assertEqual(self.fx.result(rep, "G6")["status"], "fail")       # and it is undeclared
+
+    def test_ci_uses_the_candidate_policy_when_framework_maintenance_is_declared(self):
+        full_production_setup(self.fx)
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC.replace(
+            "Risk tier: production", "Risk tier: production\nFramework maintenance: yes", 1))
+        toml = (self.fx.root / "agentic.toml").read_text(encoding="utf-8")
+        self.fx.write("agentic.toml", toml.replace("max_lines = 50", "max_lines = 5000"))
+        self.fx.write("AGENTS.md", GOOD_AGENTS + "x\n" * 60)
+        self.fx.commit("declared framework maintenance")
+        rep = gate.run(self.fx.root, "ci", "main", None)
+        self.assertIn("framework maintenance declared", rep["policy"])
+        self.assertEqual(self.fx.result(rep, "G1")["status"], "pass", rep["policy"])
+        self.assertEqual(self.fx.result(rep, "G6")["status"], "pass",
+                         self.fx.result(rep, "G6")["evidence"])
+
+    def test_ci_falls_back_to_the_candidate_policy_when_the_base_ref_has_none(self):
+        """First install: the base ref predates agentic.toml, so there is no old policy to judge by
+        and the reason is recorded rather than assumed."""
+        full_production_setup(self.fx)
+        self.fx.commit("the change")
+        rep = gate.run(self.fx.root, "ci", "no-such-ref", None)
+        self.assertIn("candidate", rep["policy"])
+        self.assertIn("no base ref", rep["policy"])
 
     def test_g6_reads_the_committed_diff_so_a_ci_restore_cannot_hide_the_edit(self):
         full_production_setup(self.fx)
@@ -584,9 +677,17 @@ class Integrity(unittest.TestCase):
         out = gate.enforce_verdict(rep)
         self.assertFalse(out["ok"])
         self.assertIn("integrity_error", out)
-        clean = gate.enforce_verdict({"ok": True, "results": [{"gate": "G4", "status": "not_applicable"}]})
+        clean = gate.enforce_verdict({"ok": True, "results": [{"gate": "G4", "status": "not_applicable"},
+                                                              {"gate": "G6", "status": "pass"}]})
         self.assertTrue(clean["ok"])
         self.assertNotIn("integrity_error", clean)
+
+    def test_a_report_with_no_g6_result_is_not_a_pass(self):
+        """Dropping the failing result and the required_gates list together used to leave a report
+        that re-derived as a pass, because an empty required list skipped the coverage check."""
+        rep = gate.enforce_verdict({"ok": True, "results": [{"gate": "G0", "status": "pass"}]})
+        self.assertFalse(rep["ok"])
+        self.assertIn("integrity_error", rep)
 
     def test_a_tampered_runner_cannot_report_a_pass(self):
         """S14 from the stress test: ok = True spliced into the runner, in the change it judges."""
@@ -683,6 +784,32 @@ class Integrity(unittest.TestCase):
         g6 = self.fx.result(self.fx.run(), "G6")
         self.assertEqual(g6["status"], "fail", g6["evidence"])
         self.assertTrue(any("neither adds" in e for e in g6["evidence"]), g6["evidence"])
+
+    def test_g6_reads_a_declaration_in_a_spec_whose_name_is_not_ascii(self):
+        """git C-quotes unusual path names in line-oriented output, so the declaration in a spec
+        with an accented filename was invisible to every check that renews it."""
+        self.fx.branch("feature/SPEC-0007-thing")
+        self.fx.write("specs/SPEC-0007-\u00f1.md", GOOD_SPEC.replace(
+            "Risk tier: production", "Risk tier: production\nFramework maintenance: yes", 1))
+        self.fx.write("handoffs/HANDOFF-0007.md", GOOD_HANDOFF)
+        self.fx.write(".agentic/gate.py", "# stand-in\n# tampered\n")
+        rep = self.fx.run()
+        self.assertEqual(self.fx.result(rep, "G0")["status"], "pass")
+        g6 = self.fx.result(rep, "G6")
+        self.assertEqual(g6["status"], "pass", g6["evidence"])
+
+    def test_g6_sees_a_symlinked_runtime_artefact_whose_name_is_not_ascii(self):
+        self.fx.branch("feature/SPEC-0007-thing")
+        blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=self.fx.root,
+                              input="../../agentic.toml", capture_output=True, text=True,
+                              encoding="utf-8")
+        sha = blob.stdout.strip()
+        self.assertTrue(sha, blob.stderr)
+        git(self.fx.root, "update-index", "--add", "--cacheinfo",
+            f"120000,{sha},.agentic/runs/trace-\u00f1.json")
+        g6 = self.fx.result(self.fx.run(stage="commit"), "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+        self.assertTrue(any("trace-" in e for e in g6["evidence"]), g6["evidence"])
 
     def test_g6_will_not_take_a_declaration_from_an_unreferenced_permit_file(self):
         """P0: a one-line specs/permit.md that G0 never looked at authorises nothing."""

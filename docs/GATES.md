@@ -25,6 +25,13 @@ Secrets are checked at every tier. A spike that leaks a key is still a leak. G6 
 and every stage too, and is deliberately absent from `[tiers.required]`: a gate that detects edits
 to `agentic.toml` cannot be switched off by editing `agentic.toml`.
 
+The tier is a floor, not a ceiling. A branch named `proto/*` or `internal/*` whose change set
+touches `paths.source` is evaluated at **production** tier: the branch name is an assertion about
+risk, and the diff is the only thing in the repository that can contradict it. The change is not
+rejected for it — a spike stays a spike right up to the moment it carries shipping source — it is
+simply judged by the full set. `--tier` may raise the tier the branch implies and may never lower
+it, for the same reason.
+
 ## G0 spec
 
 - A spec is referenced when `SPEC-NNNN` appears in the branch name, in a commit message since the
@@ -71,6 +78,19 @@ to `agentic.toml` cannot be switched off by editing `agentic.toml`.
 - Python imports are parsed with `ast`; JS/TS with a regex over `import`/`require`. Anything that is
   not stdlib, not a local module, and not declared in `requirements*.txt`, `pyproject.toml` or
   `package.json` fails. `review.import_aliases` maps import names to distribution names.
+- **Declared is not the same as real.** A name that is declared must also resolve, offline: Python
+  with `importlib.util.find_spec` in the interpreter running the gate, JS/TS against the contents of
+  `node_modules`. A name that resolves to nothing fails, and so does one that resolves only to a
+  directory holding no importable module — an empty directory named after the package used to make a
+  hallucinated import read as a local one, and Python's implicit namespace packages made the same
+  trick work for an installed one. A local directory is only a local module if it actually contains
+  one.
+- The gate never asks a package index and never opens a socket. "Exists" means "resolves in the
+  environment the gate is running in". When it cannot see that environment — the project ships a
+  `.venv/` the gate is not running inside, or there is no `node_modules` — the existence half is
+  reported as `import existence: not_applicable` **with the reason**, and the declaration check
+  still applies. It is never a silent pass. Run the gate with the project's own interpreter, and
+  install its packages in the CI job, or this half of G4 cannot tell you anything.
 
 ## G5 handoff
 
@@ -103,14 +123,27 @@ to `agentic.toml` cannot be switched off by editing `agentic.toml`.
   never ran the gate is not protected at all.
 - Fails when the base ref resolves to the candidate's own tip on any branch other than the project's
   base branch. `--base HEAD` empties the diff, which would otherwise be a skip flag by another name.
-- Fails when the change set touches `paths.source` and the branch is not production tier. The tier
-  is an assertion by whoever named the branch; this is the only thing in the repository that can
-  contradict it. Renaming a branch to `docs/whatever` used to drop G0, G3 and G5 silently.
+- Raises the tier to production when the change set touches `paths.source` on a prototype- or
+  internal-tier branch, and says so in its evidence. The tier is an assertion by whoever named the
+  branch; this is the only thing in the repository that can contradict it. Renaming a branch to
+  `docs/whatever` used to drop G0, G3 and G5 silently; now it drops nothing. The change is judged at
+  production tier rather than refused, so the tier system still means something for work that really
+  is a spike.
 - Fails when `--tier` is passed a tier below the one the branch implies. The lower value is ignored
   and the branch's tier stands, so a lowered `--tier` cannot reduce what runs.
 - Fails when no base ref resolves: with no change set, none of the above can be checked.
 - The change set it reads is the working tree **and** the committed diff against the base, so a CI
   step that restores the runner from the base ref does not hide the edit it protects against.
+- **At `--stage ci` the policy itself is read from the base ref**, so a pull request that relaxes a
+  rule is judged by the rule it replaces rather than by its replacement. The exception is the same
+  authorising channel as above: when the change declares `Framework maintenance: yes` in the
+  G0-valid spec it references, with the declaration in this diff, the candidate's own `agentic.toml`
+  is used, so a policy change can still be exercised by the change proposing it. That question is
+  answered while the base policy is in force, so the candidate cannot steer it with its own
+  `[paths]` or `[spec]` keys. Every report carries a `policy:` line saying which was used.
+  This lives in `resolve_policy()` in the runner and not in the workflow on purpose: on a
+  `pull_request` event the CI definition comes from the branch, so a restore written in YAML is a
+  rule the candidate carries, while the runner CI executes is unpacked from the base ref.
 - Separately, `verdict()` derives the overall pass or fail from the recorded gate statuses, and
   `enforce_verdict()` re-derives it wherever a report is produced or consumed. A report that lists a
   failure cannot carry a pass verdict, and neither can one whose results do not cover the gates it
@@ -145,15 +178,11 @@ deliberately:
   test file which always passes is the S5 case, and is a code review problem, not a gate problem.
 - **Push events are not restored.** The restore is guarded on pull request events; a direct push to
   a protected branch is outside the model, which is what branch protection is for.
-- **A pull request that relaxes policy is judged by its own new policy, not the one it replaces.**
-  CI restores `.agentic/` from the base ref and nothing else: `load_config()` reads the branch's
-  `agentic.toml`, deliberately, so that a policy change can be exercised by the change proposing it.
-  What stops a change granting itself a weaker policy is that the trusted G6 fails any undeclared
-  edit to `agentic.toml`, so the relaxation has to be declared in a spec and read by a human. An
-  earlier version of this document claimed CI restored the policy too and that a relaxation was
-  therefore judged by the old rules. That was never true of the workflows, whose own comments say
-  the opposite. Whether it *should* be is a design decision for the repository owner; it is open,
-  and it is recorded in `handoffs/HANDOFF-SPEC-0002.md` rather than assumed.
+- **The policy restore is a CI property, not a local one.** At `--stage local` and in the hook the
+  gates read the branch's own `agentic.toml`, because that is the copy the author is working on.
+  Locally the protection is only that G6 fails an undeclared edit to it. An earlier version of this
+  document claimed the restore already happened in CI when it did not; it now does, and it is
+  described in "G6 integrity" above rather than promised here.
 - **A CI definition that runs the gate is protected in full**, not just its lines that name
   `gate.py`. The revision the workflow trusts, the checkout depth, an enclosing `if:` and an
   injected `PYTHONPATH` all decide what the judge is, and none of them mentions the runner. The

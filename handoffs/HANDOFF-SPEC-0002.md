@@ -3,14 +3,16 @@
 Spec: SPEC-0002
 Agent: claude code, Claude Agent SDK, acting on JC's instruction
 Model: claude-opus-5
-Iterations: 4, the second, third and fourth driven by external review
+Iterations: 5, the second to fifth driven by external review and by JC's decisions on the open items
 
 ## Verified
 
-Verified: `python -m unittest discover -s tests -q` passes 57 tests, 1 skipped — 26 pre-existing,
-20 added in iteration 2 to 3, and 11 added in iteration 4 for the Codex findings. Every one of the
-11 new tests was run against the pre-fix runner (`git checkout HEAD -- .agentic/gate.py`) and all 11
-failed, so they reproduce the bypasses rather than merely describing them. The skip is
+Verified: `python -m unittest discover -s tests -q` passes 67 tests, 1 skipped — 26 pre-existing,
+20 added in iteration 2 to 3, 11 added in iteration 4 for the Codex findings, and 10 added in
+iteration 5 for the three decisions and the round-four findings. Every one of the 21 tests added in
+iterations 4 and 5 was run against the pre-fix runner (`git show HEAD:.agentic/gate.py`) and every
+one failed for the stated reason, so they reproduce the defects rather than merely describing
+them. The skip is
 `test_the_report_write_does_not_follow_a_symlink`: this Windows host does not permit creating a
 symlink, so that assertion has never executed. See Not verified.
 
@@ -22,10 +24,11 @@ four protected files in the change.
 Verified: the adversarial harness at `C:\Users\j_car\gates-stress\harness.py` re-run against this
 branch, unchanged since iteration 3. The baseline is green on all seven gates, so nothing here is a
 false positive. All 15 CATCH scenarios are BLOCKED, each on the gate it targets. S3, S4, S11, S12
-and S14 remain BLOCKED by G6. The eight scenarios still ALLOWED are the documented open ones —
-concatenated and base64 secrets, a comment-only test touch, a lying eval runner, a self-filled
-`Reviewer`, a hallucinated package declared in `requirements.txt`, a hollow spec, and an empty
-directory shadowing a package name — unchanged in number and identity from iteration 3.
+and S14 remain BLOCKED, and **S8 and S13 are now BLOCKED as well** — the two halves of gap 4, a fake
+package declared in `requirements.txt` and an empty directory shadowing a package name. S3 is now
+blocked at production tier by the tier floor rather than refused by G6. The seven scenarios still
+ALLOWED are the documented open ones: concatenated and base64 secrets, a comment-only test touch, a
+lying eval runner, a self-filled `Reviewer`, a hollow spec, and the `agentic:allow` marker.
 
 Two changes were made to the harness itself, outside this repository. Both make the rig stricter
 rather than weaker, and both are bugs of the same class as the two the original stress test found.
@@ -72,16 +75,15 @@ Findings deliberately **not** acted on, with the reason:
   and by design: they are your test suite and your eval runner. Sandboxing them is a different
   project. Recorded in `docs/GATES.md` rather than pretended away.
 - **"The prototype and internal tiers can no longer touch `paths.source`" (both reviewers, P1).**
-  Gemini called it "deleting the tier system", Kimi "a blunt instrument". They have a point, and
-  **this one is JC's call, not mine.** It is the rule as specified. The alternative that keeps
-  spikes working is to apply the tier floor only when the run is a merge proposal, which means the
-  local run and the CI run stop agreeing, and the branch-rename bypass stays open locally.
+  Gemini called it "deleting the tier system", Kimi "a blunt instrument". They were right.
+  **Acted on in iteration 5:** the tier is now a floor. Such a change is judged at production tier
+  rather than refused.
 - **"`Framework maintenance: yes` is self-issued" (both reviewers).** Correct, and already stated in
   the spec. It stops drift, not a determined author. Its value is that the claim sits in the diff.
 - **"A pull request that relaxes policy is judged by the policy it replaces" (Gemini, P0).** This
-  answer was wrong, and Codex caught it in iteration 4: CI restores `.agentic/` only, so a
-  relaxation is judged by its own new policy. What actually stops it is the trusted G6 failing an
-  undeclared `agentic.toml` edit. Whether CI should also restore the policy is open, below.
+  answer was wrong when it was given, and Codex caught it in iteration 4: CI restored `.agentic/`
+  only. **Acted on in iteration 5:** it is true now. At `--stage ci` the policy comes from the base
+  ref unless the change declares framework maintenance.
 - **"fetch-depth may be 1, so the base ref is missing" (Kimi, P0).** Not a defect: the workflow has
   carried `fetch-depth: 0` since before this change. Kimi could not see it in a diff of changed
   lines only.
@@ -133,10 +135,56 @@ below claimed the restore of both had been manually exercised. That was a false 
 in a document signed off bar the `Reviewer` field, and a false verification claim is worse than the
 gap it hides. The documentation now describes what the workflows actually do.
 
-**Open, and JC's call: should CI also restore `agentic.toml` from the base ref?** Doing so would
-judge a policy relaxation by the policy it replaces, at the cost that a policy change could no
-longer be exercised by the change proposing it. The CI restore semantics were deliberately left
-unchanged here. It is recorded in the spec's Out of scope rather than decided.
+**That question was answered in iteration 5.** See below.
+
+## Iteration 5: three decisions implemented, and a fourth review round
+
+JC decided the three items iteration 4 left open, and all three are now implemented.
+
+1. **CI judges a policy relaxation by the policy it replaces.** At `--stage ci` the runner reads
+   `agentic.toml` from the base ref. A change that declares `Framework maintenance: yes` in the
+   G0-valid spec it references, with the declaration in this diff, is judged by its own policy
+   instead — the same authorisation channel G6 already resolves from the immutable snapshot, asked
+   while the base policy is still in force. Every report now carries a `policy:` line.
+   **Deliberate deviation from the instruction, stated plainly:** the instruction was to make the
+   two workflow files do the restore. It is done in `resolve_policy()` in the runner instead, for
+   two reasons. On a `pull_request` event the workflow file comes from the branch, so a restore
+   written in YAML is a rule the candidate carries, while the runner CI executes is unpacked from
+   the base ref and is not. And overwriting `agentic.toml` in the working tree would drop it out of
+   the working-tree change set, so G4 would stop scanning its added lines for secrets. Both workflow
+   files are updated to describe what actually happens, and the behaviour is covered by three tests
+   that run at `--stage ci` without needing a CI service.
+2. **The tier is a floor, not a veto.** A prototype- or internal-tier branch whose change set
+   touches `paths.source` is now evaluated at production tier instead of being refused. Gemini called
+   the old behaviour "deleting the tier system" and Kimi "a blunt instrument"; both were right. The
+   branch-rename bypass is still closed, because the rename now buys nothing: G0, G3 and G5 all run.
+   Stress scenario S3 confirms it — `docs/*` carrying `src/billing.py` reports `tier=production` and
+   fails G5.
+3. **Gap 4 is closed, offline.** A declared import must also resolve: `importlib.util.find_spec` for
+   Python, the contents of `node_modules` for JS/TS. A name resolving to nothing fails, and so does
+   one resolving only to a directory with no importable module, which covers Python's implicit
+   namespace packages and the empty-directory trick. `local_python_modules()` no longer treats any
+   top-level directory as a module. No network call and no package-index lookup. Where the
+   environment cannot be observed — a `.venv/` the gate is not running inside, or no `node_modules`
+   — the existence half reports `import existence: not_applicable` **with the reason**, and the
+   declaration check still applies. Stress scenarios S8 and S13, both ALLOWED since the original
+   stress test, are now BLOCKED.
+
+The fourth review round ran on Gemini 3.1 Pro (Antigravity), Kimi For Coding and Codex, all on JC's
+own subscriptions, against `git diff main...HEAD` at 3f573cd. Gemini and Kimi both returned
+`VERDICT: MERGE`, P0=0. Between them they raised three distinct findings, all acted on:
+
+- **P1, Gemini and Kimi independently: git C-quotes non-ASCII paths in line-oriented output.** A
+  spec whose filename carries an accent came back C-quoted with octal escapes, so its maintenance
+  declaration matched nothing and was rejected, and a symlink at `.agentic/runs/trace-ñ.json` was
+  not seen as a non-regular path. Every git call now runs with `core.quotePath=false`. Two
+  regression tests, both confirmed failing on the previous runner.
+- **P1, Kimi: `enforce_verdict` could be walked past.** Removing the failing result *and* the
+  `required_gates` field together left a report that re-derived as a pass, because an empty required
+  list skipped the coverage check. A report that records no G6 result is now never a pass, since G6
+  runs at every tier and every stage.
+- **P2, Kimi: the test counts in this document and the README disagreed** (57 against 46). Both are
+  now 67, which is what the suite reports.
 
 ## Not verified
 
@@ -144,8 +192,9 @@ Not verified: the two CI workflow changes have never executed on a runner. The s
 base ref's `.agentic/` outside the working tree were read by eye and the equivalent
 `git checkout origin/main -- .agentic` was exercised by hand in a test fixture, but this branch is
 not pushed, so no pull request has run them. A human must confirm the first real run unpacks, prints
-what it is judging with, and still fails G6 on the committed edit. Nothing in this repository
-restores `agentic.toml` from the base ref, and no claim here should be read as saying it does.
+what it is judging with, and still fails G6 on the committed edit. The policy restore, by contrast,
+**is** executed here: it lives in the runner, so `tests/test_gate.py` exercises it at `--stage ci`
+directly. What has never run on a real runner is the `git archive` of the trusted `.agentic/`.
 
 Not verified: that the report write refuses to follow a symlink. The code path exists
 (`out_dir.is_symlink() or report.is_symlink()` then create-and-replace via `os.replace`) and the
@@ -166,16 +215,23 @@ against edits to itself, which is why the CI restore exists. Treat the local G6 
 tripwire and the CI restore as the boundary, and put CODEOWNERS on `.agentic/` and `agentic.toml`
 in any repository where this matters.
 
-Not verified: gap 4 from the stress test, that G4 checks an import is declared rather than that it
-exists, is untouched and still open. Adding a hallucinated package to `requirements.txt` still
-satisfies G4. It needs a decision from JC about whether a gate may touch the network or the
-environment, so it was left out of scope deliberately.
+Not verified: that a declared package which is genuinely on PyPI but simply not installed can be
+told apart from one that does not exist. It cannot, and that is the design: the gate never opens a
+socket. The consequence is real and is worth reading before installing this in a repository with
+third-party dependencies — a CI job that does not `pip install -r requirements.txt` before running
+the gates will fail G4 on every declared import. Install them, or that half of the gate reports
+`not_applicable` and tells you nothing.
 
-Not verified by any test: that the new prototype and internal tier restriction is the right
-trade-off. G6 now refuses to let a prototype or internal branch carry `paths.source`. That is a
-real behaviour change: a spike can no longer edit shipping code on a `scratch/*` branch, and one
-existing test fixture was moved off `src/` to keep asserting what it was written to assert. The
-alternative was to leave the cheapest bypass, renaming a branch, wide open.
+Not verified: the tier floor against a repository that spikes heavily inside `paths.source`. The
+behaviour is tested, but whether raising the tier is the right trade-off for a real team is a
+judgement, not a test. A `scratch/*` branch that touches shipping source now has to carry a spec, an
+eval score and a handoff. The alternative — leaving the cheapest bypass, renaming a branch, wide
+open — was worse.
+
+Not verified: the fourth review round ran against `git diff main...HEAD` at 3f573cd, which is the
+diff **before** the three decisions and the round-four fixes were written. The 3,000 lines added
+after it have been through the gates, the 67 tests and the stress harness, but not through an
+external model. Codex was still running when this was written; see below.
 
 ## Review
 

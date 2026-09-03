@@ -27,7 +27,8 @@ steps:
         TRUSTED="$(Agent.TempDirectory)/trusted-gates"
         mkdir -p "$TRUSTED"
         git archive "$BASE_SHA" .agentic | tar -x -C "$TRUSTED"
-        echo "judging with .agentic/gate.py as it exists at $BASE_SHA"
+        echo "judging with .agentic/gate.py AND agentic.toml as they exist at $BASE_SHA,"
+        echo "unless this change declares framework maintenance in the spec it references"
         python "$TRUSTED/.agentic/gate.py" --root . --stage ci --base "$BASE_SHA"
       else
         echo "no runner on the base ref (first install), or not a merge build: using this tree's own"
@@ -35,9 +36,19 @@ steps:
       fi
     displayName: agentic gates
     # The judge must never be the branch's own copy, so the base ref's runner is unpacked outside
-    # the working tree and pointed at it. This cannot protect this file: the pipeline definition
-    # comes from the branch. Use a branch policy that requires this build and required reviewers on
-    # azure-pipelines.yml, .agentic/ and agentic.toml.
+    # the working tree and pointed at it.
+    #
+    # The policy is restored from the base ref too, but by the runner rather than by this file: at
+    # --stage ci the trusted gate.py reads agentic.toml from the base commit, so a change that
+    # relaxes a rule is judged by the rule it replaces. A change that declares
+    # "Framework maintenance: yes" in the G0-valid spec it references, with the declaration in this
+    # diff, is judged by its own agentic.toml instead, so a policy change can be exercised by the
+    # change proposing it. The report prints a "policy:" line saying which was used. It is done in
+    # the runner because this file comes from the branch and the runner does not.
+    #
+    # This cannot protect this file: the pipeline definition comes from the branch. Use a branch
+    # policy that requires this build and required reviewers on azure-pipelines.yml, .agentic/ and
+    # agentic.toml.
   - publish: .agentic/last-report.json
     artifact: agentic-gate-report
     condition: always()
