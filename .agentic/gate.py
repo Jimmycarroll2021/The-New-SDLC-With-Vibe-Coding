@@ -282,12 +282,15 @@ def gate_g0_spec(ctx: Ctx) -> GateResult:
     required = [s.lower() for s in ctx.cfg_get("spec", "required_sections", default=[])]
     id_re = re.compile(r"SPEC-\d{3,}")
     ids = set(id_re.findall(ctx.branch)) | set(id_re.findall(ctx.repo.commit_messages(ctx.base)))
+    hdir = ctx.cfg_get("paths", "handoffs", default="handoffs").rstrip("/") + "/"
     for f in ctx.changed:
         if f.replace("\\", "/").startswith(spec_dir.rstrip("/") + "/"):
             ids |= set(id_re.findall(f))
+        elif f.replace("\\", "/").startswith(hdir) and f.endswith(".md"):
+            ids |= set(id_re.findall(read_text(ctx.repo.root / f) or ""))   # the handoff's Spec: field
     if not ids:
         return _fail("G0", "no spec referenced",
-                     [f"reference a SPEC-NNNN in the branch name, a commit message, or add/modify a file under {spec_dir}/",
+                     [f"reference a SPEC-NNNN in the branch name, a commit message, a changed handoff's Spec: field, or add/modify a file under {spec_dir}/",
                       f"template: .agentic/templates/SPEC.md"])
     evidence, problems = [], []
     for sid in sorted(ids):
