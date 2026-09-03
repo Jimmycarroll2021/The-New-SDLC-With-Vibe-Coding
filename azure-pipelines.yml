@@ -15,6 +15,18 @@ steps:
     inputs:
       versionSpec: "3.11"
   # Add dependency installs here if tests.command needs them
+  - script: |
+      set -e
+      TARGET=$(echo "$(System.PullRequest.TargetBranch)" | sed 's|refs/heads/||')
+      git fetch -q origin "$TARGET"
+      echo "policy and runner changes proposed by this pull request:"
+      git diff --stat "origin/$TARGET...HEAD" -- .agentic agentic.toml
+      git checkout "origin/$TARGET" -- .agentic agentic.toml \
+        || echo "the base ref carries no .agentic/ or agentic.toml yet: first install"
+    displayName: restore the gates from the base ref
+    condition: eq(variables['Build.Reason'], 'PullRequest')
+    # The judge must never be the branch's own copy. G6 still reports the edit: it reads the
+    # committed diff as well as the working tree.
   - script: python .agentic/gate.py --stage ci
     displayName: agentic gates
     # System.PullRequest.TargetBranch and SourceBranch are read automatically

@@ -12,7 +12,7 @@ Usage:
   python .agentic/gate.py                      # local: working tree vs base branch
   python .agentic/gate.py --stage commit       # pre-commit: staged diff, cheap gates
   python .agentic/gate.py --stage ci --base origin/main
-  python .agentic/gate.py --tier production    # override tier detection
+  python .agentic/gate.py --tier production    # raise the tier; it can never be lowered
   python .agentic/gate.py --json               # machine-readable report on stdout
 """
 from __future__ import annotations
@@ -37,8 +37,16 @@ GATE_NAMES = {
     "G3": "evals: AI surface scored against a rubric",
     "G4": "review: no secrets, no hallucinated dependencies",
     "G5": "handoff: agent run is recorded",
+    "G6": "integrity: the change does not set the rules it is judged by",
 }
 TIER_RANK = {"prototype": 0, "internal": 1, "production": 2}
+
+# G6. The policy and the runner must not be edited by the change they judge. Hard-coded, with
+# no key in agentic.toml: a check that detects edits to agentic.toml cannot live in agentic.toml.
+PROTECTED_FILES = ("agentic.toml",)
+PROTECTED_DIRS = (".agentic/",)
+PROTECTED_RUNTIME = [".agentic/last-report.json", ".agentic/runs/**", ".agentic/evals/result.json",
+                     "**/__pycache__/**", "*.pyc"]
 PLACEHOLDER = re.compile(r"^\s*(<[^>]*>|TBD|TODO|\.\.\.|n/?a)?\s*$", re.I)
 
 # import name -> distribution name, for packages whose two names differ
@@ -197,6 +205,15 @@ class Repo:
                 result[f] = list(enumerate(text.splitlines(), start=1))
         return result
 
+    def committed_changed_files(self, base: str | None) -> list[str]:
+        """Commit-to-commit view. CI restores the policy and the runner from the base ref before
+        running, which clears them from the working tree; this is how G6 still sees them."""
+        mb = self.merge_base(base)
+        if not mb:
+            return []
+        out = self.git("diff", "--name-only", "--diff-filter=ACMR", f"{mb}..HEAD")
+        return sorted(f for f in out.splitlines() if f.strip())
+
     def is_tracked(self, rel: str) -> bool:
         return bool(self.git("ls-files", "--error-unmatch", rel).strip())
 
@@ -227,6 +244,14 @@ def match_any(path: str, globs: list[str]) -> bool:
     return False
 
 
+def is_protected(path: str) -> bool:
+    """True for the policy and the runner, false for the artefacts they write at run time."""
+    p = path.replace("\\", "/")
+    if match_any(p, PROTECTED_RUNTIME):
+        return False
+    return p in PROTECTED_FILES or p.startswith(PROTECTED_DIRS)
+
+
 # ----------------------------------------------------------------------------- context
 
 @dataclass
@@ -239,6 +264,8 @@ class Ctx:
     branch: str
     changed: list[str]
     changed_mode: str
+    committed: list[str] = field(default_factory=list)
+    tier_override_problem: str | None = None
     _added: dict | None = None
 
     def cfg_get(self, *keys, default=None):
@@ -262,6 +289,23 @@ def detect_tier(cfg: dict, branch: str) -> str:
         if any(fnmatch.fnmatch(branch, g) for g in globs):
             return tier
     return cfg.get("tiers", {}).get("default", "production")
+
+
+def resolve_tier(cfg: dict, branch: str, requested: str | None) -> tuple[str, str | None]:
+    """--tier may raise the tier the branch implies. It may never lower it: the tier decides
+    which gates apply, so lowering it from the command line is a skip flag by another name."""
+    tier = detect_tier(cfg, branch)
+    if tier not in TIER_RANK:
+        raise SystemExit(f"unknown tier '{tier}' in agentic.toml. Known: {list(TIER_RANK)}")
+    if not requested:
+        return tier, None
+    if requested not in TIER_RANK:
+        raise SystemExit(f"unknown tier '{requested}'. Known: {list(TIER_RANK)}")
+    if TIER_RANK[requested] < TIER_RANK[tier]:
+        return tier, (f"--tier {requested} is below the tier '{tier}' that branch '{branch}' implies. "
+                      f"The tier decides which gates apply, so lowering it is a skip flag. The run stays "
+                      f"'{tier}': move the work to a {requested} branch instead.")
+    return requested, None
 
 
 def headings(text: str) -> list[str]:
@@ -290,17 +334,37 @@ def tail(text: str, n: int = 25) -> list[str]:
 
 # ----------------------------------------------------------------------------- gates
 
+def referenced_spec_ids(ctx: Ctx) -> set[str]:
+    """A spec is referenced by the branch name, a commit message since the base, the path of a
+    changed file under paths.specs, or the Spec: field of a changed handoff."""
+    spec_dir = ctx.cfg_get("paths", "specs", default="specs").rstrip("/") + "/"
+    hdir = ctx.cfg_get("paths", "handoffs", default="handoffs").rstrip("/") + "/"
+    id_re = re.compile(r"SPEC-\d{3,}")
+    ids = set(id_re.findall(ctx.branch)) | set(id_re.findall(ctx.repo.commit_messages(ctx.base)))
+    for f in ctx.changed:
+        rel = f.replace("\\", "/")
+        if rel.startswith(spec_dir):
+            ids |= set(id_re.findall(f))
+        elif rel.startswith(hdir) and f.endswith(".md"):
+            ids |= set(id_re.findall(read_text(ctx.repo.root / f) or ""))   # the handoff's Spec: field
+    return ids
+
+
+def maintenance_spec(ctx: Ctx) -> str | None:
+    """The referenced spec that declares this change to be framework maintenance, if any."""
+    spec_dir = ctx.cfg_get("paths", "specs", default="specs")
+    for sid in sorted(referenced_spec_ids(ctx)):
+        for spec in sorted((ctx.repo.root / spec_dir).glob(f"**/{sid}*.md")):
+            val = (field_value(read_text(spec) or "", "Framework maintenance") or "").lower().strip("* ")
+            if val.startswith(("yes", "true")):
+                return spec.relative_to(ctx.repo.root).as_posix()
+    return None
+
+
 def gate_g0_spec(ctx: Ctx) -> GateResult:
     spec_dir = ctx.cfg_get("paths", "specs", default="specs")
     required = [s.lower() for s in ctx.cfg_get("spec", "required_sections", default=[])]
-    id_re = re.compile(r"SPEC-\d{3,}")
-    ids = set(id_re.findall(ctx.branch)) | set(id_re.findall(ctx.repo.commit_messages(ctx.base)))
-    hdir = ctx.cfg_get("paths", "handoffs", default="handoffs").rstrip("/") + "/"
-    for f in ctx.changed:
-        if f.replace("\\", "/").startswith(spec_dir.rstrip("/") + "/"):
-            ids |= set(id_re.findall(f))
-        elif f.replace("\\", "/").startswith(hdir) and f.endswith(".md"):
-            ids |= set(id_re.findall(read_text(ctx.repo.root / f) or ""))   # the handoff's Spec: field
+    ids = referenced_spec_ids(ctx)
     if not ids:
         return _fail("G0", "no spec referenced",
                      [f"reference a SPEC-NNNN in the branch name, a commit message, a changed handoff's Spec: field, or add/modify a file under {spec_dir}/",
@@ -636,8 +700,52 @@ def gate_g5_handoff(ctx: Ctx) -> GateResult:
     return _pass("G5", evidence)
 
 
+def gate_g6_integrity(ctx: Ctx) -> GateResult:
+    """The change may not set the rules it is judged by, nor understate its own risk tier.
+
+    Locally this is a tripwire: a change that edits the runner can edit this gate out of it in
+    the same breath. The boundary that holds is CI, which restores .agentic/ and agentic.toml
+    from the base ref before running, so the judge is never the branch's own copy."""
+    problems, evidence = [], []
+    if ctx.tier_override_problem:
+        problems.append(ctx.tier_override_problem)
+    if ctx.changed_mode.startswith("no base resolvable"):
+        problems.append("no base ref resolvable: with no change set, neither the policy, the runner "
+                        "nor the tier can be checked against the diff. Fetch the base branch, or pass --base.")
+        change_set: list[str] = []
+    elif "whole-tree audit" in ctx.changed_mode:
+        evidence.append(f"nothing differs from {ctx.base}: the policy, runner and tier checks are vacuous")
+        change_set = []
+    else:
+        change_set = sorted(set(ctx.changed) | set(ctx.committed))
+    protected = [f for f in change_set if is_protected(f)]
+    if protected:
+        declared = maintenance_spec(ctx)
+        if ctx.tier != "production":
+            problems.append(f"{protected[:6]}: the policy and the runner may not be changed from a "
+                            f"'{ctx.tier}' branch. Framework maintenance is production work.")
+        elif declared is None:
+            problems.append(f"{protected[:6]}: this change edits the policy or the runner that judges it. "
+                            "If it is deliberate framework maintenance, say so in the spec with a "
+                            "'Framework maintenance: yes' field so that a human reviews it. CI restores "
+                            "both from the base ref before running the gates.")
+        else:
+            evidence.append(f"declared framework maintenance in {declared}: {protected[:6]}")
+    src = [f for f in change_set if match_any(f, ctx.cfg_get("paths", "source", default=[]))]
+    if src and ctx.tier != "production":
+        problems.append(f"branch '{ctx.branch}' claims tier '{ctx.tier}', but the change carries production "
+                        f"source: {src[:6]}. A tier that does not run G0, G3 or G5 may not ship source. "
+                        "Move the work to a production branch.")
+    evidence.append(f"change set {len(change_set)} files: {len(protected)} policy or runner, {len(src)} source; "
+                    f"branch '{ctx.branch}' is tier '{ctx.tier}'")
+    if problems:
+        return _fail("G6", "the change alters what judges it", problems)
+    return _pass("G6", evidence)
+
+
 GATES = {"G0": gate_g0_spec, "G1": gate_g1_context, "G2": gate_g2_tests,
-         "G3": gate_g3_evals, "G4": gate_g4_review, "G5": gate_g5_handoff}
+         "G3": gate_g3_evals, "G4": gate_g4_review, "G5": gate_g5_handoff,
+         "G6": gate_g6_integrity}
 
 
 # ----------------------------------------------------------------------------- runner
@@ -647,6 +755,24 @@ def load_config(root: Path) -> dict:
     if not p.is_file():
         raise SystemExit(f"agentic.toml not found in {root}. Copy it from the framework and edit [paths].")
     return tomllib.loads(p.read_text(encoding="utf-8"))
+
+
+def verdict(results) -> bool:
+    """The overall result is a function of the recorded gate statuses and of nothing else."""
+    return all((r["status"] if isinstance(r, dict) else r.status) in ("pass", "not_applicable")
+               for r in results)
+
+
+def enforce_verdict(rep: dict) -> dict:
+    """Re-derive the verdict wherever a report is produced or consumed. A report that records a
+    failure can never carry a pass, however the value in it was computed. This is what a runner
+    edited to say ok = True runs into."""
+    ok = verdict(rep.get("results", []))
+    if rep.get("ok") and not ok:
+        rep["integrity_error"] = ("the runner reported a pass while the report records a failure: "
+                                  ".agentic/gate.py has been modified or is corrupt")
+    rep["ok"] = ok
+    return rep
 
 
 def find_root(start: Path) -> Path:
@@ -660,9 +786,7 @@ def run(root: Path, stage: str, base: str | None, tier_override: str | None) -> 
     cfg = load_config(root)
     repo = Repo(root)
     branch = repo.branch()
-    tier = tier_override or detect_tier(cfg, branch)
-    if tier not in TIER_RANK:
-        raise SystemExit(f"unknown tier '{tier}'. Known: {list(TIER_RANK)}")
+    tier, tier_problem = resolve_tier(cfg, branch, tier_override)
     if base is None and stage != "commit":
         env = os.environ if repo.ci_env_applies() else {}
         base = (env.get("GITHUB_BASE_REF") and f"origin/{env['GITHUB_BASE_REF']}") \
@@ -677,19 +801,22 @@ def run(root: Path, stage: str, base: str | None, tier_override: str | None) -> 
             else:
                 base = None
     changed, mode = repo.changed_files(base, stage == "commit")
-    ctx = Ctx(repo, cfg, stage, base, tier, branch, changed, mode)
-    required = list(cfg.get("tiers", {}).get("required", {}).get(tier, list(GATES)))
+    ctx = Ctx(repo, cfg, stage, base, tier, branch, changed, mode,
+              committed=repo.committed_changed_files(base), tier_override_problem=tier_problem)
+    default = [g for g in GATES if g != "G6"]
+    required = list(cfg.get("tiers", {}).get("required", {}).get(tier, default))
     if stage == "commit":
         commit_gates = cfg.get("stages", {}).get("commit", ["G1", "G4"])
         required = [g for g in required if g in commit_gates]
+    required = [g for g in required if g != "G6"] + ["G6"]   # unconditional: no tier, no stage, no key
     results = [GATES[g](ctx) for g in GATES if g in required]
-    ok = all(r.ok for r in results)
-    return {
+    ok = verdict(results)
+    return enforce_verdict({
         "ok": ok, "stage": stage, "branch": branch, "tier": tier, "base": base,
         "changed_files": len(changed), "changed_mode": mode, "required_gates": required,
         "results": [asdict(r) for r in results],
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-    }
+    })
 
 
 def print_report(rep: dict, stream=sys.stdout) -> None:
@@ -706,6 +833,8 @@ def print_report(rep: dict, stream=sys.stdout) -> None:
             w(f"         - {e}\n")
         if len(r["evidence"]) > 12:
             w(f"         - ... {len(r['evidence']) - 12} more\n")
+    if rep.get("integrity_error"):
+        w(f"\n  INTEGRITY  {rep['integrity_error']}\n")
     w("\n" + ("ALL GATES PASS" if rep["ok"] else "GATE FAILURE: the change is not ready") + "\n\n")
 
 
@@ -713,12 +842,13 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Deterministic gates for the agentic-engineering SDLC.")
     ap.add_argument("--stage", choices=["local", "commit", "ci"], default="local")
     ap.add_argument("--base", help="base ref to diff against (default: project.base_branch, or CI target branch)")
-    ap.add_argument("--tier", choices=list(TIER_RANK), help="override tier detection")
+    ap.add_argument("--tier", choices=list(TIER_RANK),
+                    help="raise the tier above the one the branch implies; it cannot be lowered")
     ap.add_argument("--root", help="repo root (default: nearest directory containing agentic.toml)")
     ap.add_argument("--json", action="store_true", help="print the JSON report instead of the table")
     a = ap.parse_args(argv)
     root = Path(a.root).resolve() if a.root else find_root(Path.cwd().resolve())
-    rep = run(root, a.stage, a.base, a.tier)
+    rep = enforce_verdict(run(root, a.stage, a.base, a.tier))
     out_dir = root / ".agentic"
     try:
         out_dir.mkdir(exist_ok=True)

@@ -121,6 +121,7 @@ class RepoFixture:
         self.write("agentic.toml", BASE_TOML)
         self.write("AGENTS.md", GOOD_AGENTS)
         self.write("README.md", "hello\n")
+        self.write(".agentic/gate.py", "# stand-in for the runner, so G6 has something to protect\n")
         git(self.root, "add", "-A")
         git(self.root, "commit", "-q", "-m", "init")
 
@@ -189,13 +190,13 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(statuses["G3"], "not_applicable")
         self.assertTrue(rep["ok"], json.dumps(rep, indent=1))
 
-    def test_prototype_tier_runs_only_g4(self):
+    def test_prototype_tier_runs_only_g4_and_the_unconditional_g6(self):
         self.fx.branch("proto/idea")
-        self.fx.write("src/x.py", "import os\n")
+        self.fx.write("notes/x.py", "import os\n")     # not paths.source: a spike may not carry source
         rep = self.fx.run()
         self.assertEqual(rep["tier"], "prototype")
-        self.assertEqual([r["gate"] for r in rep["results"]], ["G4"])
-        self.assertTrue(rep["ok"])
+        self.assertEqual([r["gate"] for r in rep["results"]], ["G4", "G6"])
+        self.assertTrue(rep["ok"], json.dumps(rep, indent=1))
 
     def test_ci_env_vars_ignored_for_a_repo_that_is_not_the_ci_workspace(self):
         # regression: the first GitHub Actions run leaked GITHUB_REF_NAME=main into the fixtures
@@ -213,7 +214,7 @@ class EndToEnd(unittest.TestCase):
         full_production_setup(self.fx)
         self.fx.stage("src/thing.py")
         rep = self.fx.run(stage="commit")
-        self.assertEqual([r["gate"] for r in rep["results"]], ["G1", "G4"])
+        self.assertEqual([r["gate"] for r in rep["results"]], ["G1", "G4", "G6"])
 
     # ---- G0
     def test_g0_fails_without_spec(self):
@@ -403,6 +404,131 @@ class EndToEnd(unittest.TestCase):
                            capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(p.returncode, 1)
         self.assertFalse(json.loads(p.stdout)["ok"])
+
+
+class Integrity(unittest.TestCase):
+    """G6: the change may not set the rules it is judged by. SPEC-0002."""
+
+    def setUp(self):
+        self.fx = RepoFixture()
+
+    def tearDown(self):
+        self.fx.close()
+
+    def test_g6_cannot_be_removed_by_editing_the_policy(self):
+        full_production_setup(self.fx)
+        toml = (self.fx.root / "agentic.toml").read_text(encoding="utf-8")
+        self.fx.write("agentic.toml", toml.replace('production = ["G0", "G1", "G2", "G3", "G4", "G5"]',
+                                                   'production = ["G4"]'))
+        rep = self.fx.run()
+        self.assertIn("G6", [r["gate"] for r in rep["results"]])
+        g6 = self.fx.result(rep, "G6")
+        self.assertEqual(g6["status"], "fail")
+        self.assertTrue(any("agentic.toml" in e for e in g6["evidence"]), g6["evidence"])
+        self.assertFalse(rep["ok"])
+
+    def test_g6_fails_on_a_runner_edit_then_allows_declared_maintenance(self):
+        full_production_setup(self.fx)
+        self.fx.write(".agentic/gate.py", "# stand-in\n# tampered\n")
+        g6 = self.fx.result(self.fx.run(), "G6")
+        self.assertEqual(g6["status"], "fail")
+        self.assertTrue(any(".agentic/gate.py" in e for e in g6["evidence"]), g6["evidence"])
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC.replace(
+            "Risk tier: production", "Risk tier: production\nFramework maintenance: yes", 1))
+        g6 = self.fx.result(self.fx.run(), "G6")
+        self.assertEqual(g6["status"], "pass", g6["evidence"])
+        self.assertTrue(any("framework maintenance" in e for e in g6["evidence"]), g6["evidence"])
+
+    def test_g6_will_not_take_a_maintenance_declaration_from_a_low_tier_branch(self):
+        self.fx.branch("internal/SPEC-0007-thing")
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC.replace(
+            "Risk tier: production", "Risk tier: production\nFramework maintenance: yes", 1))
+        toml = (self.fx.root / "agentic.toml").read_text(encoding="utf-8")
+        self.fx.write("agentic.toml", toml + "\n# weakened\n")
+        g6 = self.fx.result(self.fx.run(), "G6")
+        self.assertEqual(g6["status"], "fail")
+        self.assertTrue(any("internal" in e for e in g6["evidence"]), g6["evidence"])
+
+    def test_g6_ignores_runtime_artefacts_under_agentic(self):
+        full_production_setup(self.fx)
+        self.fx.write(".agentic/last-report.json", "{}\n")
+        self.fx.write(".agentic/runs/r1/trace.json", "{}\n")
+        self.fx.write(".agentic/evals/result.json", "{}\n")
+        g6 = self.fx.result(self.fx.run(), "G6")
+        self.assertEqual(g6["status"], "pass", g6["evidence"])
+
+    def test_g6_fails_when_a_low_tier_branch_carries_production_source(self):
+        self.fx.branch("internal/sneaky")
+        self.fx.write("src/billing.py", "def charge(c):\n    return c * 2\n")
+        self.fx.write("tests/test_billing.py", "def test_c():\n    pass\n")
+        rep = self.fx.run()
+        self.assertEqual(rep["tier"], "internal")
+        g6 = self.fx.result(rep, "G6")
+        self.assertEqual(g6["status"], "fail")
+        self.assertTrue(any("src/billing.py" in e for e in g6["evidence"]), g6["evidence"])
+        self.assertFalse(rep["ok"])
+
+    def test_g6_reads_the_committed_diff_so_a_ci_restore_cannot_hide_the_edit(self):
+        full_production_setup(self.fx)
+        self.fx.commit("the change")
+        toml = (self.fx.root / "agentic.toml").read_text(encoding="utf-8")
+        self.fx.write("agentic.toml", toml.replace("max_lines = 50", "max_lines = 5000"))
+        self.fx.commit("weaken the policy")
+        git(self.fx.root, "checkout", "main", "--", "agentic.toml")     # what CI does before running
+        self.assertNotIn("max_lines = 5000", (self.fx.root / "agentic.toml").read_text(encoding="utf-8"))
+        g6 = self.fx.result(self.fx.run(), "G6")
+        self.assertEqual(g6["status"], "fail")
+        self.assertTrue(any("agentic.toml" in e for e in g6["evidence"]), g6["evidence"])
+
+    def test_tier_override_may_raise(self):
+        self.fx.branch("proto/idea")
+        self.fx.write("notes/x.md", "x\n")
+        rep = self.fx.run(tier="production")
+        self.assertEqual(rep["tier"], "production")
+        self.assertEqual(self.fx.result(rep, "G6")["status"], "pass")
+
+    def test_tier_override_may_not_lower(self):
+        full_production_setup(self.fx)
+        rep = self.fx.run(tier="prototype")
+        self.assertEqual(rep["tier"], "production")
+        self.assertEqual([r["gate"] for r in rep["results"]], ["G0", "G1", "G2", "G3", "G4", "G5", "G6"])
+        g6 = self.fx.result(rep, "G6")
+        self.assertEqual(g6["status"], "fail")
+        self.assertTrue(any("--tier prototype" in e for e in g6["evidence"]), g6["evidence"])
+        self.assertFalse(rep["ok"])
+
+    def test_g6_fails_without_a_resolvable_base(self):
+        full_production_setup(self.fx)
+        rep = gate.run(self.fx.root, "local", "no-such-ref", None)
+        g6 = self.fx.result(rep, "G6")
+        self.assertEqual(g6["status"], "fail")
+        self.assertIn("no base ref", " ".join(g6["evidence"]))
+
+    def test_verdict_is_a_function_of_the_recorded_results(self):
+        rep = {"ok": True, "results": [{"gate": "G2", "status": "fail"}, {"gate": "G4", "status": "pass"}]}
+        out = gate.enforce_verdict(rep)
+        self.assertFalse(out["ok"])
+        self.assertIn("integrity_error", out)
+        clean = gate.enforce_verdict({"ok": True, "results": [{"gate": "G4", "status": "not_applicable"}]})
+        self.assertTrue(clean["ok"])
+        self.assertNotIn("integrity_error", clean)
+
+    def test_a_tampered_runner_cannot_report_a_pass(self):
+        """S14 from the stress test: ok = True spliced into the runner, in the change it judges."""
+        full_production_setup(self.fx)
+        os.remove(self.fx.root / "handoffs/HANDOFF-0007.md")          # guarantees a real G5 failure
+        src = (ROOT / ".agentic/gate.py").read_text(encoding="utf-8")
+        tampered = src.replace("    ok = verdict(results)", "    ok = True")
+        self.assertNotEqual(src, tampered, "the verdict line moved: update this test")
+        with tempfile.TemporaryDirectory() as td:
+            fake = Path(td) / "gate.py"
+            fake.write_text(tampered, encoding="utf-8")
+            p = subprocess.run([sys.executable, str(fake), "--root", str(self.fx.root), "--base", "main", "--json"],
+                               capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        rep = json.loads(p.stdout)
+        self.assertFalse(rep["ok"])
+        self.assertIn("integrity_error", rep)
 
 
 class Loop(unittest.TestCase):

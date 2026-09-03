@@ -16,6 +16,16 @@ jobs:
         with:
           python-version: "3.11"
       # Add your own dependency install here if tests.command needs it (pip install -r requirements.txt, npm ci ...)
+      - name: Restore the gates from the base ref
+        if: github.event_name == 'pull_request'
+        # The judge must never be the branch's own copy: a PR that rewrites agentic.toml or gate.py
+        # would otherwise be graded by its own rewrite. G6 still reports the edit, because it reads
+        # the committed diff as well as the working tree.
+        run: |
+          echo "policy and runner changes proposed by this pull request:"
+          git diff --stat "origin/${GITHUB_BASE_REF}...HEAD" -- .agentic agentic.toml
+          git checkout "origin/${GITHUB_BASE_REF}" -- .agentic agentic.toml \
+            || echo "the base ref carries no .agentic/ or agentic.toml yet: first install"
       - name: Run gates
         run: python .agentic/gate.py --stage ci
         # GITHUB_BASE_REF / GITHUB_HEAD_REF are read automatically; on push, main is compared to itself

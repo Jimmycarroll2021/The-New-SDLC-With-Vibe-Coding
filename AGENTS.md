@@ -22,7 +22,11 @@ Rules for any coding agent working in this repository. This file is the single s
 
 - Do not add a skip, force or override flag to any gate. If a gate should not apply, change the tier.
 - Do not weaken a gate to make a change pass. Fix the change.
-- Do not edit `agentic.toml` `[tiers]` or `[stages]` as part of a feature change.
+- Do not edit `agentic.toml` or anything under `.agentic/` as part of a feature change. G6 fails it,
+  and CI restores both from the base ref, so the branch's copy never grades the branch.
+- Framework maintenance is the exception: a production branch whose spec says
+  `Framework maintenance: yes`. Say it in the spec, not in the code.
+- Do not carry `paths.source` on a prototype or internal branch. That tier does not run G0, G3 or G5.
 - Do not commit secrets, `.env` files, or private keys. The hook blocks them; do not route around it.
 - Do not import a package that is not stdlib, local, or declared in a manifest.
 - Do not claim work is done without running `python .agentic/gate.py` and pasting the result.

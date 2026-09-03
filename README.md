@@ -30,6 +30,7 @@ The last line is the point. A gate says pass or fail with evidence. It never say
 | **G3 evals** | an AI-surface change scores below the bar, has too few cases, no rubric, or a stub target | "evals verify the parts that are not deterministic"; "the bar is the eval, not the demo" |
 | **G4 review** | a secret pattern in an added line, a `.env`/`.pem` in the diff, or an import that is not stdlib, local, or declared | "check imports for real packages"; the hook that blocks the hard-coded password |
 | **G5 handoff** | no `handoffs/HANDOFF-*.md` in the change, or a required field is a placeholder | "traces of every agent run"; "clear handoff protocols" |
+| **G6 integrity** | the change edits `agentic.toml` or `.agentic/` without a spec that declares framework maintenance, a low-tier branch carries production source, `--tier` is used to lower the tier, or no base ref resolves | a control point an agent can rewrite is not a control point |
 
 Which gates apply is decided by **risk tier**, derived from the branch name in `agentic.toml`:
 
@@ -39,7 +40,12 @@ Which gates apply is decided by **risk tier**, derived from the branch name in `
 | internal | `internal/*` `tooling/*` `docs/*` | G1 G2 G4 |
 | production | `main` `release/*` `feature/*` `fix/*` and anything else | all six |
 
-There is no `--skip`. If a gate should not apply, the work is on the wrong branch.
+**G6 is on top of that table, at every tier and every stage.** It is not listed in
+`[tiers.required]` and has no key of its own, because a gate that detects edits to `agentic.toml`
+cannot be switched off by editing `agentic.toml`.
+
+There is no `--skip`. If a gate should not apply, the work is on the wrong branch, and the branch
+name is checked against the diff rather than believed. `--tier` can raise the tier, never lower it.
 
 ## Install into a repository (five minutes)
 
@@ -117,7 +123,7 @@ agent_command = "gemini -p -"                              # or anything: {promp
 agentic.toml                     policy: tiers, paths, commands, thresholds
 AGENTS.md  CLAUDE.md  GEMINI.md  rules, and two one-line pointers to them
 .agentic/
-  gate.py                        the six gates and the runner (stdlib only)
+  gate.py                        the gates and the runner (stdlib only)
   loop.py                        agent -> gates -> route failure back
   templates/                     SPEC.md, HANDOFF.md, AGENTS.template.md, PULL_REQUEST_TEMPLATE.md
   hooks/                         pre-commit + install_hooks.py
@@ -125,7 +131,7 @@ AGENTS.md  CLAUDE.md  GEMINI.md  rules, and two one-line pointers to them
 specs/  handoffs/                one file per change, checked by G0 and G5
 docs/GATES.md                    what each gate checks and why
 adapters/                        optional per-tool conveniences
-tests/test_gate.py               26 tests; each builds a real temporary git repo
+tests/test_gate.py               37 tests; each builds a real temporary git repo
 ```
 
 ## What it deliberately does not do

@@ -11,6 +11,7 @@ None of them consults a model. Which gates apply is decided by risk tier in `age
 | G3 evals | Is the AI surface scored against a rubric above the bar? | "Evals verify the parts that are not deterministic"; "set the bar at the eval, not the demo" |
 | G4 review | Any secrets or hallucinated dependencies in the diff? | "Check imports for real packages"; the hook that blocks a hard-coded password |
 | G5 handoff | Is there a record of what the agent did and what was verified? | "Traces of every agent run"; "clear handoff protocols govern the boundary" |
+| G6 integrity | Does the change edit the policy or the runner that judges it, or claim a tier its diff contradicts? | "The gate is the control point"; a control an agent can rewrite is not a control |
 
 ## Tier matrix (default)
 
@@ -20,7 +21,9 @@ None of them consults a model. Which gates apply is decided by risk tier in `age
 | internal | `internal/*`, `tooling/*`, `docs/*` | G1 G2 G4 |
 | production | `main`, `release/*`, `feature/*`, `fix/*`, everything else | G0 G1 G2 G3 G4 G5 |
 
-Secrets are checked at every tier. A spike that leaks a key is still a leak.
+Secrets are checked at every tier. A spike that leaks a key is still a leak. G6 runs at every tier
+and every stage too, and is deliberately absent from `[tiers.required]`: a gate that detects edits
+to `agentic.toml` cannot be switched off by editing `agentic.toml`.
 
 ## G0 spec
 
@@ -76,6 +79,31 @@ Secrets are checked at every tier. A spike that leaks a key is still a leak.
 - If the `Spec:` field names a spec, that spec file must exist.
 - `Reviewer:` is meant to be filled by a human. `loop.py` treats "only Reviewer missing" as the
   terminal state `ready_for_human_review`.
+
+## G6 integrity
+
+- Fails when the change set touches `agentic.toml` or anything under `.agentic/`, unless the branch
+  is production tier **and** a referenced spec carries a `Framework maintenance: yes` field. The
+  runtime artefacts those tools write, `.agentic/last-report.json`, `.agentic/runs/`,
+  `.agentic/evals/result.json` and compiled Python, are exempt.
+- Fails when the change set touches `paths.source` and the branch is not production tier. The tier
+  is an assertion by whoever named the branch; this is the only thing in the repository that can
+  contradict it. Renaming a branch to `docs/whatever` used to drop G0, G3 and G5 silently.
+- Fails when `--tier` is passed a tier below the one the branch implies. The lower value is ignored
+  and the branch's tier stands, so a lowered `--tier` cannot reduce what runs.
+- Fails when no base ref resolves: with no change set, none of the above can be checked.
+- The change set it reads is the working tree **and** the committed diff against the base, so a CI
+  step that restores the policy and the runner from the base ref does not hide the edit it protects
+  against.
+- Separately, `verdict()` derives the overall pass or fail from the recorded gate statuses, and
+  `enforce_verdict()` re-derives it wherever a report is produced or consumed. A report that lists a
+  failure cannot carry a pass verdict.
+
+**What G6 is, honestly.** Locally, in the hook and in `loop.py`, it is a tripwire: a change that
+edits the runner can edit G6 out of the runner in the same commit. Nothing that runs from inside a
+branch can defend itself against edits to itself. The boundary that holds is the CI step that
+restores `.agentic/` and `agentic.toml` from the base ref before running the gates, so the judge is
+never the branch's own copy. Put CODEOWNERS on both paths in any repository that matters.
 
 ## What the gates deliberately do not do
 
