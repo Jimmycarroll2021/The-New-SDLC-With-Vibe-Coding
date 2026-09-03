@@ -185,11 +185,11 @@ matters.
 19. The run-time exemption under `.agentic/` applies to regular files and directories only. A
     symlink or gitlink at an exempt path is protected, and the runner writes its report by
     create-and-replace so that it can never be written through such a link.
-20. At `--stage ci` the policy is read from the base ref, so a change that relaxes a rule is judged
+20. At `--stage ci` the policy is read from the merge base, so a change that relaxes a rule is judged
     by the rule it replaces. The report names the policy source. A change that declares framework
     maintenance in the spec it references is judged by its own `agentic.toml` instead, and that
-    decision is taken while the base policy is in force. With no `agentic.toml` on the base ref the
-    candidate's is used and the reason is recorded, not assumed.
+    decision is taken while the base policy is in force. With no `agentic.toml` at the merge base
+    the candidate's is used and the reason is recorded, not assumed.
 21. Locally and in the hook the candidate's own policy is used, so a policy change can be worked on.
 22. A declared import must resolve in the environment the gate runs in. A name in
     `requirements*.txt` or `package.json` that resolves to nothing fails G4, and so does one that
@@ -206,6 +206,16 @@ matters.
 25. A report that records no G6 result is not a pass, whatever else it contains. Dropping the
     failing result and the `required_gates` list together used to leave a report that re-derived as
     a pass, because an empty required list skipped the coverage check.
+26. The `not_applicable` escape on the import existence check cannot be issued by the change being
+    judged. A virtualenv marker that appears in this change's change set does not disable the
+    check, and neither does a `pyvenv.cfg` with no library directory behind it; both are reported.
+    `mkdir .venv && touch .venv/pyvenv.cfg` is the obvious attempt and it fails.
+27. A real namespace package passes. `site-packages/google/` holds no module of its own, so the
+    importable-directory test recurses; a one-level test would fail every `google-cloud-*` import.
+    An empty directory, at any depth within the limit, still fails.
+28. Emptying `paths.source` in the candidate's own `agentic.toml` does not defeat the tier floor.
+    It cannot be emptied without editing the policy, and a protected path on a non-production
+    branch fails G6 before any declaration is considered.
 
 ## Out of scope
 
@@ -267,10 +277,11 @@ framework is installed. A regression here is not visible in the report it produc
 
 ## Verification
 
-- Criteria 1 to 7, 12 to 18 and 20 to 25: `tests/test_gate.py`, classes `Integrity` and `EndToEnd`,
+- Criteria 1 to 7, 12 to 18 and 20 to 28: `tests/test_gate.py`, classes `Integrity` and `EndToEnd`,
   each building a real temporary git repository and asserting the failure mode and the matching
-  pass. 67 tests, one skipped (see criterion 19). Every test added for criteria 20 to 25 was run
-  against the previous runner first and observed to fail for the stated reason.
+  pass. 71 tests, one skipped (see criterion 19). Each test added for criteria 20 to 25 was run
+  against the previous runner first: five failed on the assertion and three errored on the absent
+  `policy` key, which is itself the proof that the behaviour did not exist.
 - Criterion 19: the protection half is tested (`test_g6_treats_a_symlinked_runtime_artefact_as_
   protected`, which builds the symlink through the git index so it runs on Windows). The write half
   is tested by `test_the_report_write_does_not_follow_a_symlink`, which **skips** on a host that

@@ -7,12 +7,15 @@ Iterations: 5, the second to fifth driven by external review and by JC's decisio
 
 ## Verified
 
-Verified: `python -m unittest discover -s tests -q` passes 67 tests, 1 skipped — 26 pre-existing,
-20 added in iteration 2 to 3, 11 added in iteration 4 for the Codex findings, and 10 added in
-iteration 5 for the three decisions and the round-four findings. Every one of the 21 tests added in
-iterations 4 and 5 was run against the pre-fix runner (`git show HEAD:.agentic/gate.py`) and every
-one failed for the stated reason, so they reproduce the defects rather than merely describing
-them. The skip is
+Verified: `python -m unittest discover -s tests -q` passes 71 tests, 1 skipped — 26 pre-existing,
+20 added in iteration 2 to 3, 11 added in iteration 4 for the Codex findings, and 14 added in
+iteration 5 for the three decisions and the round-four and round-five findings. Every test added in
+iteration 4 was run against the pre-fix runner and failed. Of the eight added first in iteration 5,
+five failed on an assertion and three errored on the absent `policy` key. Of the four added after
+the round-five review, three failed against the pre-fix runner; the fourth,
+`test_the_tier_floor_cannot_be_emptied_by_the_candidates_own_paths_source`, passed on both, because
+it is a guard against a reported bypass that turned out not to reproduce rather than a regression
+test for a fix. The skip is
 `test_the_report_write_does_not_follow_a_symlink`: this Windows host does not permit creating a
 symlink, so that assertion has never executed. See Not verified.
 
@@ -142,7 +145,8 @@ gap it hides. The documentation now describes what the workflows actually do.
 JC decided the three items iteration 4 left open, and all three are now implemented.
 
 1. **CI judges a policy relaxation by the policy it replaces.** At `--stage ci` the runner reads
-   `agentic.toml` from the base ref. A change that declares `Framework maintenance: yes` in the
+   `agentic.toml` from the merge base — where the branch diverged, so the answer does not move if
+   the target branch advances mid-run. A change that declares `Framework maintenance: yes` in the
    G0-valid spec it references, with the declaration in this diff, is judged by its own policy
    instead — the same authorisation channel G6 already resolves from the immutable snapshot, asked
    while the base policy is still in force. Every report now carries a `policy:` line.
@@ -184,7 +188,44 @@ own subscriptions, against `git diff main...HEAD` at 3f573cd. Gemini and Kimi bo
   list skipped the coverage check. A report that records no G6 result is now never a pass, since G6
   runs at every tier and every stage.
 - **P2, Kimi: the test counts in this document and the README disagreed** (57 against 46). Both are
-  now 67, which is what the suite reports.
+  now 71, which is what the suite reports.
+
+## Round five: the new work reviewed in turn
+
+Round four judged the diff at 3f573cd, which predates everything above. So the three decisions and
+their fixes were sent back to Gemini and Kimi as their own diff. Gemini returned `VERDICT: BLOCK`
+with a P0; Kimi returned `VERDICT: MERGE` with three P1s. Six of the seven findings were acted on,
+and the seventh was tested and found not to reproduce.
+
+- **P0, Gemini: the `not_applicable` escape was self-issued.** `mkdir .venv && touch
+  .venv/pyvenv.cfg` in the change under judgement disabled the whole Python existence check — a skip
+  flag written in the diff being judged, which is exactly what this framework forbids. Fixed: a
+  virtualenv that appears in the change's own change set does not disable the check, and neither
+  does a `pyvenv.cfg` with no library directory behind it. Both refusals are reported in the
+  evidence. Two regression tests.
+- **P1, Gemini: nested namespace packages.** `dir_has_importable` looked one level deep, so
+  `site-packages/google/`, which holds no module of its own until `google/cloud/storage/__init__.py`
+  two levels down, read as an empty directory and would have failed every `google-cloud-*` import.
+  The search now recurses to a depth of three. The empty-directory case still fails.
+- **P1, Gemini: the tier floor could be emptied by clearing `paths.source` and declaring framework
+  maintenance.** Tested at both `local` and `ci` stages and it **does not reproduce**:
+  `paths.source` cannot be emptied without editing `agentic.toml`, which is a protected path, and a
+  protected path on a non-production branch fails G6 before any declaration is considered. Kept as
+  `test_the_tier_floor_cannot_be_emptied_by_the_candidates_own_paths_source` so it stays that way.
+- **P1, Kimi: `find_spec` can raise `OSError`** from an unreadable `sys.path` entry, crashing the
+  gate. Added to the caught set.
+- **P1, Kimi: `resolve()` equality is the wrong identity test** for "am I running inside this
+  virtualenv" — a symlinked root or a case-folded Windows path would compare unequal and skip the
+  check while running in it. Now `samefile`, falling back to `resolve()` if the stat fails.
+- **P1, Kimi: only `.venv`, `venv` and `env` were recognised.** Any top-level directory carrying a
+  `pyvenv.cfg` is now recognised.
+- **P2, Kimi: "base ref" should read "merge base".** The policy is read from the commit where the
+  branch diverged, not the current tip of the base branch, so the answer does not move if the target
+  branch advances mid-run. Corrected in `docs/GATES.md`, the spec and here.
+- **P2, Gemini: this document overstated how the round-four tests failed.** Five of the eight new
+  tests failed on an assertion against the previous runner; three *errored* on the absent `policy`
+  key, which is proof the behaviour did not exist but is not the same thing as a clean failure. Said
+  accurately above and in the spec.
 
 ## Not verified
 

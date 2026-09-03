@@ -134,7 +134,9 @@ it, for the same reason.
 - Fails when no base ref resolves: with no change set, none of the above can be checked.
 - The change set it reads is the working tree **and** the committed diff against the base, so a CI
   step that restores the runner from the base ref does not hide the edit it protects against.
-- **At `--stage ci` the policy itself is read from the base ref**, so a pull request that relaxes a
+- **At `--stage ci` the policy itself is read from the merge base** — the commit where the branch
+  diverged, not the current tip of the base branch, so the answer does not move if the target branch
+  advances mid-run. A pull request that relaxes a
   rule is judged by the rule it replaces rather than by its replacement. The exception is the same
   authorising channel as above: when the change declares `Framework maintenance: yes` in the
   G0-valid spec it references, with the declaration in this diff, the candidate's own `agentic.toml`

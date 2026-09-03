@@ -387,13 +387,48 @@ class EndToEnd(unittest.TestCase):
     def test_g4_import_existence_is_not_applicable_without_the_projects_interpreter(self):
         """Never a silent pass: when the project ships a virtualenv the gate is not running in, the
         existence half is reported as not applicable, with the reason."""
+        self.fx.write(".venv/pyvenv.cfg", "home = /usr/bin\n")          # on main: it predates the change
+        self.fx.write(".venv/Lib/site-packages/.keep", "")
+        self.fx.commit("the developer's virtualenv, tracked here only so the fixture can see it")
         self.fx.branch("proto/venv")
-        self.fx.write(".venv/pyvenv.cfg", "home = /usr/bin\n")
         self.fx.write("requirements.txt", "totallynotapackage==1.0\n")
         self.fx.write("notes/fetch.py", "import totallynotapackage\n")
         g4 = self.fx.result(self.fx.run(), "G4")
         self.assertEqual(g4["status"], "pass", g4["evidence"])
         self.assertTrue(any("import existence: not_applicable" in e for e in g4["evidence"]), g4["evidence"])
+
+    def test_g4_a_virtualenv_the_change_brings_with_it_does_not_disable_the_check(self):
+        """The not_applicable escape must not be self-issued: `mkdir .venv && touch
+        .venv/pyvenv.cfg` in the change under judgement is a skip flag written in the diff."""
+        self.fx.branch("proto/fakevenv")
+        self.fx.write(".venv/pyvenv.cfg", "home = /usr/bin\n")
+        self.fx.write(".venv/Lib/site-packages/.keep", "")
+        self.fx.write("requirements.txt", "totallynotapackage==1.0\n")
+        self.fx.write("notes/fetch.py", "import totallynotapackage\n")
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertEqual(g4["status"], "fail", g4["evidence"])
+        self.assertTrue(any("is part of this change" in e for e in g4["evidence"]), g4["evidence"])
+        self.assertTrue(any("not installed" in e for e in g4["evidence"]), g4["evidence"])
+
+    def test_g4_a_pyvenv_marker_with_no_library_directory_does_not_disable_the_check(self):
+        self.fx.write(".venv/pyvenv.cfg", "home = /usr/bin\n")
+        self.fx.commit("a bare marker, no environment behind it")
+        self.fx.branch("proto/barevenv")
+        self.fx.write("requirements.txt", "totallynotapackage==1.0\n")
+        self.fx.write("notes/fetch.py", "import totallynotapackage\n")
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertEqual(g4["status"], "fail", g4["evidence"])
+        self.assertTrue(any("no library directory" in e for e in g4["evidence"]), g4["evidence"])
+
+    def test_g4_accepts_a_namespace_package_whose_module_is_two_levels_down(self):
+        """False positive guard: site-packages/google/ holds no module of its own, and a one-level
+        check would fail every google-cloud-* import."""
+        self.fx.branch("proto/namespace")
+        (self.fx.root / "nspkg/cloud/storage").mkdir(parents=True)
+        self.fx.write("nspkg/cloud/storage/__init__.py", "")
+        self.fx.write("notes/use.py", "import nspkg.cloud.storage\n")
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertEqual(g4["status"], "pass", g4["evidence"])
 
     def test_g4_rejects_a_js_package_whose_node_modules_entry_is_empty(self):
         self.fx.branch("proto/js-empty")
@@ -586,6 +621,25 @@ class Integrity(unittest.TestCase):
         self.assertEqual(self.fx.result(rep, "G0")["status"], "fail")   # the rename bought nothing
         self.assertEqual(self.fx.result(rep, "G5")["status"], "fail")
         self.assertFalse(rep["ok"])
+
+    def test_the_tier_floor_cannot_be_emptied_by_the_candidates_own_paths_source(self):
+        """Round five, Gemini: on a low-tier branch, empty paths.source and declare framework
+        maintenance, so that CI hands the run back to the candidate's policy and the floor finds
+        no source to raise the tier for. The declaration cannot help, because the tier check on a
+        protected path is decided before it: framework maintenance is production work."""
+        self.fx.branch("internal/sneaky")
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC.replace(
+            "Risk tier: production", "Risk tier: production\nFramework maintenance: yes", 1))
+        toml = (self.fx.root / "agentic.toml").read_text(encoding="utf-8")
+        self.fx.write("agentic.toml", toml.replace('source = ["src/**"]', "source = []"))
+        self.fx.write("src/billing.py", "def charge(c):\n    return c * 2\n")
+        self.fx.commit("empty paths.source and declare maintenance, on an internal branch")
+        for stage in ("local", "ci"):
+            rep = gate.run(self.fx.root, stage, "main", None)
+            g6 = self.fx.result(rep, "G6")
+            self.assertEqual(g6["status"], "fail", (stage, rep["policy"], g6["evidence"]))
+            self.assertTrue(any("internal" in e for e in g6["evidence"]), (stage, g6["evidence"]))
+            self.assertFalse(rep["ok"], stage)
 
     def test_the_tier_floor_leaves_a_branch_that_carries_no_source_alone(self):
         self.fx.branch("proto/idea")

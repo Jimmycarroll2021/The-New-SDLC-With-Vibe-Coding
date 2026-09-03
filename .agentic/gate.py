@@ -67,6 +67,7 @@ DEFAULT_IMPORT_ALIASES = {
     "serial": "pyserial", "OpenSSL": "pyopenssl", "psycopg2": "psycopg2-binary",
     "pkg_resources": "setuptools",
 }
+SKIP_DIRS = {".git", ".venv", "venv", "env", "node_modules", "__pycache__", ".tox", "dist", "build"}
 DEFAULT_SECRET_PATTERNS = [
     r"AKIA[0-9A-Z]{16}",
     r"\bghp_[A-Za-z0-9]{36}\b",
@@ -614,7 +615,7 @@ def declared_python_deps(root: Path, aliases: dict[str, str]) -> tuple[set[str],
 
 def local_python_modules(root: Path) -> set[str]:
     mods = set()
-    skip = {".git", ".venv", "venv", "node_modules", "__pycache__", ".tox", "dist", "build"}
+    skip = SKIP_DIRS
     for p in root.rglob("*"):
         if any(part in skip for part in p.parts):
             continue
@@ -629,43 +630,70 @@ def local_python_modules(root: Path) -> set[str]:
     return mods
 
 
-def dir_has_importable(d: Path) -> bool:
-    """A directory is an importable package only if it actually holds a module. An empty directory
-    named after a package is the stress test's bypass: it makes a hallucinated import read as a
-    local module, and Python's implicit namespace packages make the same trick work for an
-    installed one."""
+def dir_has_importable(d: Path, depth: int = 3) -> bool:
+    """A directory is an importable package only if it actually holds a module, at some depth.
+
+    An empty directory named after a package is the stress test's bypass: it makes a hallucinated
+    import read as a local module, and Python's implicit namespace packages make the same trick work
+    for an installed one. The search recurses because a real namespace package holds no module of its
+    own either: site-packages/google/ is empty until google/cloud/storage/__init__.py, two levels
+    down, and stopping at one level would fail every google-cloud-* import."""
     try:
         if (d / "__init__.py").is_file():
             return True
+        subdirs = []
         for c in d.iterdir():
             if c.is_file() and c.suffix in (".py", ".pyd", ".so"):
                 return True
-            if c.is_dir() and (c / "__init__.py").is_file():
-                return True
+            if c.is_dir() and c.name not in SKIP_DIRS:
+                subdirs.append(c)
+        if depth > 0:
+            return any(dir_has_importable(c, depth - 1) for c in subdirs)
     except OSError:
         return False
     return False
 
 
-def python_env_note(root: Path) -> str | None:
-    """Why the interpreter running the gate cannot say what is installed, or None if it can.
+def python_env_note(ctx: Ctx) -> tuple[str | None, str | None]:
+    """(why the existence check cannot run, why a virtualenv marker was not honoured).
 
-    Offline by construction: the gate never asks a package index, so "exists" means "resolves in
-    the environment the gate runs in". When the project ships its own virtualenv and the gate is
-    not running inside it, that environment is not observable, and the check is reported as not
-    applicable with the reason rather than passing silently."""
-    for name in (".venv", "venv", "env"):
-        d = root / name
-        if (d / "pyvenv.cfg").is_file():
+    Offline by construction: the gate never asks a package index, so "exists" means "resolves in the
+    environment the gate runs in". When the project ships its own virtualenv and the gate is not
+    running inside it, that environment is not observable, and the existence half is reported as not
+    applicable with the reason rather than passing silently.
+
+    The escape is deliberately not something a change can grant itself. A marker this change brings
+    with it is ignored, and so is one with no library directory behind it: either would be a skip
+    flag for half of G4, written in the diff being judged. `mkdir .venv && touch .venv/pyvenv.cfg`
+    is the obvious attempt and it does not work."""
+    root = ctx.repo.root
+    changed = {f.replace("\\", "/") for f in set(ctx.changed) | set(ctx.integrity.change_set)}
+    try:    # any directory carrying pyvenv.cfg, not only .venv/venv/env
+        envs = sorted(d for d in root.iterdir() if d.is_dir() and (d / "pyvenv.cfg").is_file())
+    except OSError:
+        envs = []
+    for d in envs:
+        name = d.name
+        try:    # samefile, not resolve(): a symlinked root or a case-folded Windows path is the
+                # same environment, and getting that wrong skips the check while running inside it
+            if Path(sys.prefix).samefile(d):
+                return None, None          # the gate is running in it: check normally
+        except OSError:
             try:
                 if Path(sys.prefix).resolve() == d.resolve():
-                    return None
+                    return None, None
             except OSError:
                 pass
-            return (f"the project's packages are installed in ./{name}, which is not the interpreter "
-                    f"running the gate ({sys.prefix}). Run the gate with ./{name} and declared "
-                    "imports are checked for existence as well as declaration.")
-    return None
+        if any(p == name or p.startswith(name + "/") for p in changed):
+            return None, (f"./{name} is part of this change, so it does not disable the existence "
+                          "check: an environment a change brings with it is a skip flag")
+        if not any((d / sub).is_dir() for sub in ("lib", "Lib", "lib64", "site-packages")):
+            return None, (f"./{name} has a pyvenv.cfg but no library directory, so it is not an "
+                          "environment and does not disable the existence check")
+        return (f"the project's packages are installed in ./{name}, which is not the interpreter "
+                f"running the gate ({sys.prefix}). Run the gate with ./{name} and declared "
+                "imports are checked for existence as well as declaration."), None
+    return None, None
 
 
 def python_module_exists(top: str) -> str | None:
@@ -675,7 +703,9 @@ def python_module_exists(top: str) -> str | None:
     touch the network, so the gate stays deterministic and offline."""
     try:
         spec = importlib.util.find_spec(top)
-    except (ImportError, AttributeError, ValueError, TypeError):
+    except (ImportError, AttributeError, ValueError, TypeError, OSError):
+        # OSError covers an unreadable sys.path entry: a finder raising is not a verdict about the
+        # package, but a gate that crashes is worse than one that reports what it saw.
         return "is declared but does not resolve in this environment"
     if spec is None:
         return "is declared but is not installed in this environment"
@@ -687,13 +717,16 @@ def python_module_exists(top: str) -> str | None:
     return None
 
 
-def check_python_imports(ctx: Ctx, files: list[str]) -> list[str]:
+def check_python_imports(ctx: Ctx, files: list[str]) -> tuple[list[str], list[str]]:
     aliases = dict(DEFAULT_IMPORT_ALIASES)
     aliases.update(ctx.cfg_get("review", "import_aliases", default={}))
     declared, manifests = declared_python_deps(ctx.repo.root, aliases)
     local = local_python_modules(ctx.repo.root)
     stdlib = set(sys.stdlib_module_names) | {"__future__"}
-    env_note = python_env_note(ctx.repo.root)
+    env_note, refused = python_env_note(ctx)
+    notes = [f"import existence: not_applicable - {env_note}"] if env_note else []
+    if refused:
+        notes.append(f"import existence: applied - {refused}")
     problems = []
     for f in files:
         text = read_text(ctx.repo.root / f)
@@ -728,7 +761,7 @@ def check_python_imports(ctx: Ctx, files: list[str]) -> list[str]:
                 why = None if env_note else python_module_exists(top)
                 if why:
                     problems.append(f"{f}:{ln}: import '{top}' {why}")
-    return problems, env_note
+    return problems, notes
 
 
 def js_module_exists(modules_dir: Path, name: str) -> str | None:
@@ -747,7 +780,7 @@ def js_module_exists(modules_dir: Path, name: str) -> str | None:
     return "is declared but its node_modules directory holds no importable module"
 
 
-def check_js_imports(ctx: Ctx, files: list[str]) -> tuple[list[str], str | None]:
+def check_js_imports(ctx: Ctx, files: list[str]) -> tuple[list[str], list[str]]:
     pkg = ctx.repo.root / "package.json"
     declared: set[str] = set()
     if pkg.is_file():
@@ -784,11 +817,11 @@ def check_js_imports(ctx: Ctx, files: list[str]) -> tuple[list[str], str | None]
             why = None if env_note else js_module_exists(modules_dir, name)
             if why:
                 problems.append(f"{f}:{ln}: import '{name}' {why}")
-    return problems, env_note
+    return problems, ([f"import existence: not_applicable - {env_note}"] if env_note else [])
 
 
 def gate_g4_review(ctx: Ctx) -> GateResult:
-    problems, evidence = [], []
+    problems, evidence, notes = [], [], []
     hits = scan_secrets(ctx, ctx.added)
     problems.extend(hits)
     for f in ctx.changed:
@@ -800,15 +833,16 @@ def gate_g4_review(ctx: Ctx) -> GateResult:
     if ctx.cfg_get("review", "check_hallucinated_imports", default=True):
         py = [f for f in ctx.changed if f.endswith(".py")]
         js = [f for f in ctx.changed if f.endswith((".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"))]
-        p1, n1 = check_python_imports(ctx, py) if py else ([], None)
-        p2, n2 = check_js_imports(ctx, js) if js else ([], None)
+        p1, n1 = check_python_imports(ctx, py) if py else ([], [])
+        p2, n2 = check_js_imports(ctx, js) if js else ([], [])
         problems.extend(p1 + p2)
         evidence.append(f"import check: {len(py)} python, {len(js)} js/ts files, {len(p1) + len(p2)} unresolved")
-        for note in (n1, n2):
-            if note:
-                evidence.append(f"import existence: not_applicable - {note}")
+        notes = n1 + n2
+        evidence.extend(notes)
     if problems:
-        return _fail("G4", "review findings", problems)
+        # the notes say whether the existence half ran at all, which is half the reading of a
+        # failure, so they travel with it rather than being dropped
+        return _fail("G4", "review findings", problems + notes)
     return _pass("G4", evidence)
 
 
