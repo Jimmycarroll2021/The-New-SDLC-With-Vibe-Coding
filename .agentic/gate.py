@@ -532,8 +532,9 @@ def check_python_imports(ctx: Ctx, files: list[str]) -> list[str]:
                     continue
                 if cands & declared:
                     continue
-                where = f"declared in {manifests}" if manifests else "no requirements*.txt or pyproject.toml found"
-                problems.append(f"{f}:{ln}: import '{top}' is not stdlib, not local, not {where}")
+                where = (f"not declared in {manifests}" if manifests
+                         else "and no requirements*.txt or pyproject.toml exists to declare it")
+                problems.append(f"{f}:{ln}: import '{top}' is not stdlib, not local, {where}")
     return problems
 
 
