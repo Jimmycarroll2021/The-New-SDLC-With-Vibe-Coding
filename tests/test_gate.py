@@ -218,8 +218,12 @@ class EndToEnd(unittest.TestCase):
             rep = self.fx.run()
             self.assertEqual(rep["tier"], "prototype")
             self.assertEqual(rep["branch"], "proto/idea")
-        with mock.patch.dict(os.environ, {"GITHUB_WORKSPACE": str(self.fx.root), "GITHUB_REF_NAME": "release/1"}):
-            self.assertEqual(self.fx.run()["branch"], "release/1")   # honoured when the root IS the workspace
+        # honoured when the root IS the workspace. Pin every variable the code reads: on a real PR runner
+        # GITHUB_HEAD_REF is set and would win, which is what made this test fail on GitHub the first time.
+        with mock.patch.dict(os.environ, {"GITHUB_WORKSPACE": str(self.fx.root), "GITHUB_REF_NAME": "release/1",
+                                          "GITHUB_HEAD_REF": "", "SYSTEM_PULLREQUEST_SOURCEBRANCH": "",
+                                          "BUILD_SOURCEBRANCHNAME": ""}):
+            self.assertEqual(self.fx.run()["branch"], "release/1")
 
     def test_commit_stage_restricts_to_cheap_gates(self):
         full_production_setup(self.fx)

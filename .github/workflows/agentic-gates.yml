@@ -68,3 +68,29 @@ jobs:
         with:
           name: agentic-gate-report
           path: .agentic/last-report.json
+
+  # The CD half. Runs only after every gate passed on main, and only when a named human approves
+  # in the `production` environment (Settings -> Environments -> production -> Required reviewers).
+  # Replace the placeholder step with your real deploy; keep `needs: gates` and the environment.
+  deploy:
+    needs: gates
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: agentic-gate-report
+      - name: Show the gate report this deploy is based on
+        run: |
+          python3 - <<'PY'
+          import json
+          r = json.load(open("last-report.json"))
+          print(f"gates ok={r['ok']} tier={r['tier']} branch={r['branch']} mode={r['changed_mode']}")
+          for g in r["results"]:
+              print(f"  {g['status']:>14}  {g['gate']}  {g['name']}")
+          assert r["ok"], "refusing to deploy on a failed gate report"
+          PY
+      - name: Deploy (placeholder)
+        run: echo "All gates passed and a reviewer approved. Replace this step with the real deploy for ${GITHUB_SHA::7}."

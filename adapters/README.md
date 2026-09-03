@@ -11,5 +11,10 @@ optional conveniences for specific tools. None of them changes what the gates ch
 | Cursor | `.cursor/rules/*.mdc` | `cursor/.cursor/rules/agentic.mdc` points at `AGENTS.md` |
 | Anything else | pipe `AGENTS.md` into the system prompt | `loop.py` already does this via `[loop].agent_command` |
 
+## CI
+
+GitHub Actions (`.github/workflows/agentic-gates.yml`) is the verified path. `azure-devops/`
+holds an equivalent pipeline that has not been run on a hosted agent; see its README.
+
 Keep the pointer files one line long. Duplicating rules across `CLAUDE.md`, `GEMINI.md` and
 `AGENTS.md` is how they drift.
