@@ -34,6 +34,8 @@ GOOD_SPEC = textwrap.dedent("""\
     Risk tier: production
     ## Intent
     Do the thing.
+    ## Architecture
+    one module
     ## Acceptance criteria
     1. it works
     ## Out of scope
@@ -77,7 +79,7 @@ BASE_TOML = textwrap.dedent("""\
     specs = "specs"
     handoffs = "handoffs"
     [spec]
-    required_sections = ["Intent", "Acceptance criteria", "Out of scope", "Risk tier", "Verification"]
+    required_sections = ["Intent", "Architecture", "Acceptance criteria", "Out of scope", "Risk tier", "Verification"]
     [context]
     rule_file = "AGENTS.md"
     required_sections = ["Stack", "Conventions", "Hard rules", "Workflow"]

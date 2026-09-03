@@ -35,7 +35,7 @@ handoffs   = "handoffs"
 
 # ---------------------------------------------------------------------------- G0 spec
 [spec]
-required_sections = ["Intent", "Acceptance criteria", "Out of scope", "Risk tier", "Verification"]
+required_sections = ["Intent", "Architecture", "Acceptance criteria", "Out of scope", "Risk tier", "Verification"]
 
 # ---------------------------------------------------------------------------- G1 context
 [context]

@@ -5,9 +5,9 @@ None of them consults a model. Which gates apply is decided by risk tier in `age
 
 | Gate | Question | Paper reference |
 |---|---|---|
-| G0 spec | Is there a complete spec, and does its tier match the branch? | "Formal specs, architecture docs, memory files"; "make the boundary explicit: which branches" |
+| G0 spec | Is there a complete spec with an architecture section, and does its tier match the branch? | "Formal specs, architecture docs, memory files"; "architecture remains the most human-centric phase" |
 | G1 context | Is the rule file present, bounded, sectioned and versioned? | "Start with ten lines"; "static context is expensive"; "treat AGENTS.md as code" |
-| G2 tests | Were tests touched with the source, and do they pass? | "Tests verify the deterministic parts"; "write the tests before generating the code" |
+| G2 tests | Were tests touched alongside the source, and do they pass? | "Tests verify the deterministic parts"; "write the tests before generating the code" (G2 can only verify alongside, see below) |
 | G3 evals | Is the AI surface scored against a rubric above the bar? | "Evals verify the parts that are not deterministic"; "set the bar at the eval, not the demo" |
 | G4 review | Any secrets or hallucinated dependencies in the diff? | "Check imports for real packages"; the hook that blocks a hard-coded password |
 | G5 handoff | Is there a record of what the agent did and what was verified? | "Traces of every agent run"; "clear handoff protocols govern the boundary" |
@@ -26,7 +26,9 @@ Secrets are checked at every tier. A spike that leaks a key is still a leak.
 
 - A spec is referenced when `SPEC-NNNN` appears in the branch name, in a commit message since the
   base, or in the path of a changed file under `paths.specs`.
-- Each referenced spec must exist, contain every `spec.required_sections` heading, have a
+- Each referenced spec must exist, contain every `spec.required_sections` heading (by default
+  including `Architecture`, because the paper's agentic column names architecture docs alongside
+  specs and says the model implements structural decisions rather than making them), have a
   `Risk tier:` line naming a known tier, and contain no `<placeholder>` text.
 - The spec's tier must be at least the branch's tier. A `prototype` spec on a `feature/*` branch
   fails: either move the work to a prototype branch or raise the spec.
@@ -41,6 +43,9 @@ Secrets are checked at every tier. A spike that leaks a key is still a leak.
 
 - If any changed file matches `paths.source` and none matches `paths.tests`, fail.
   A source change without a test change is the paper's definition of vibe coding.
+- This verifies tests changed **alongside** source. It cannot verify they were written **before**:
+  a diff has no ordering. "Tests before code" is the instruction in `AGENTS.md`; "tests alongside
+  code" is the fact G2 enforces. Do not read the gate as proving more than it does.
 - Otherwise run `tests.command`; non-zero exit fails with the last lines of output.
 - At `--stage commit` the run is deferred unless `tests.run_on_commit = true`.
 

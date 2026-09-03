@@ -10,6 +10,14 @@ Make the agentic-engineering row of the SDLC enforceable rather than aspirationa
 file in, model produces a multi-file diff, tests and evals both run, a CI gate passes or fails on
 evidence, and a failure is routed back to the agent automatically. Any repository, any LLM.
 
+## Architecture
+
+One stdlib-only runner (`gate.py`) exposing `run(root, stage, base, tier) -> report`; each gate is a
+pure function of a `Ctx` (repo view + config). Three callers share it: the pre-commit hook (staged
+diff, cheap gates), CI (diff vs PR target, all gates), and `loop.py` (in-process, after each agent
+turn). Policy lives in `agentic.toml`, never in code. Trade-off: TOML via `tomllib` pins Python 3.11+
+rather than adding a YAML dependency; chosen because zero installs matters more than the floor.
+
 ## Acceptance criteria
 
 1. A single command, `python .agentic/gate.py`, runs the gates that apply to the current branch's

@@ -24,9 +24,9 @@ The last line is the point. A gate says pass or fail with evidence. It never say
 
 | Gate | Fails when | Source of the rule |
 |---|---|---|
-| **G0 spec** | no `SPEC-NNNN` referenced, sections missing, placeholders left, or spec tier below branch tier | "formal specs"; "make the prototype/production boundary explicit" |
+| **G0 spec** | no `SPEC-NNNN` referenced, sections missing (Architecture included), placeholders left, or spec tier below branch tier | "formal specs, architecture docs"; "make the prototype/production boundary explicit" |
 | **G1 context** | `AGENTS.md` missing, over the line limit, missing a section, untracked, or leaking a secret | "start with ten lines"; "treat AGENTS.md as code" |
-| **G2 tests** | source changed without a test change, or the test command fails | "tests verify the deterministic parts"; "tests before code" |
+| **G2 tests** | source changed without a test change, or the test command fails | "tests verify the deterministic parts"; enforces tests *alongside* code (a diff cannot prove *before*) |
 | **G3 evals** | an AI-surface change scores below the bar, has too few cases, no rubric, or a stub target | "evals verify the parts that are not deterministic"; "the bar is the eval, not the demo" |
 | **G4 review** | a secret pattern in an added line, a `.env`/`.pem` in the diff, or an import that is not stdlib, local, or declared | "check imports for real packages"; the hook that blocks the hard-coded password |
 | **G5 handoff** | no `handoffs/HANDOFF-*.md` in the change, or a required field is a placeholder | "traces of every agent run"; "clear handoff protocols" |

@@ -359,7 +359,7 @@ def gate_g2_tests(ctx: Ctx) -> GateResult:
     evidence = [f"source files changed: {len(src)}", f"test files changed: {len(tst)}"]
     if ctx.cfg_get("tests", "require_test_touch", default=True) and src and not tst:
         return _fail("G2", "source changed without any test change",
-                     [f"changed: {f}" for f in src[:10]] + ["tests are the contract with the agent; write or update one before the code ships"])
+                     [f"changed: {f}" for f in src[:10]] + ["tests are the contract with the agent; a change that ships source without touching a test is unverified"])
     if ctx.stage == "commit" and not ctx.cfg_get("tests", "run_on_commit", default=False):
         return _pass("G2", evidence + ["test run deferred to ci/local stage (tests.run_on_commit = false)"])
     cmd = ctx.cfg_get("tests", "command")

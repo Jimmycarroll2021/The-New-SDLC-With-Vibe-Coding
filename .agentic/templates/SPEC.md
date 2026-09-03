@@ -8,6 +8,12 @@ Status: draft
 
 <What is wanted, in one to three sentences. Why it matters. Who it is for.>
 
+## Architecture
+
+<The structural decisions this change depends on or makes: components touched, what passes between
+them, the trade-off chosen and the one rejected. Link the architecture doc if one exists. The paper
+keeps this human: the model implements the decision, it does not make it.>
+
 ## Acceptance criteria
 
 <Each criterion is checkable by a test, an eval, or a deterministic gate. Number them.>
