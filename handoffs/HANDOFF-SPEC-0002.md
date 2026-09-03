@@ -3,11 +3,11 @@
 Spec: SPEC-0002
 Agent: claude code, Claude Agent SDK, acting on JC's instruction
 Model: claude-opus-5
-Iterations: 2, the second driven by external review
+Iterations: 3, the second and third driven by external review
 
 ## Verified
 
-Verified: `python -m unittest discover -s tests -q` passes 41 tests, 26 pre-existing and 15 new in
+Verified: `python -m unittest discover -s tests -q` passes 46 tests, 26 pre-existing and 20 new in
 the `Integrity` class. `python .agentic/gate.py` on this branch reports G0 to G4 and G6 pass, G3 not
 applicable, and G5 failing only on the blank `Reviewer` field below, which is the framework's
 documented terminal state. The adversarial harness at `C:\Users\j_car\gates-stress\harness.py` was

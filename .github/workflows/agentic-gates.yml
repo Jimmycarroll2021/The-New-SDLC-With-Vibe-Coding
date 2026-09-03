@@ -16,32 +16,41 @@ jobs:
         with:
           python-version: "3.11"
       # Add your own dependency install here if tests.command needs it (pip install -r requirements.txt, npm ci ...)
-      - name: Restore the gates from the base ref
-        if: github.event_name == 'pull_request'
-        # The judge must never be the branch's own copy: a PR that rewrites agentic.toml or gate.py
-        # would otherwise be graded by its own rewrite. G6 still reports the edit, because it reads
-        # the committed diff as well as the working tree.
+      - name: Run gates, judged by the base ref's runner
+        # The judge must never be the branch's own copy, or a change that rewrites agentic.toml or
+        # gate.py is graded by its own rewrite. The base ref's runner is unpacked OUTSIDE the working
+        # tree and pointed at it with --root, which matters three ways:
+        #   - the branch's own tests still import the branch's runner, so a change to the runner can
+        #     still be tested by the change that makes it;
+        #   - sys.path[0] is the trusted directory, so a Python file added under .agentic/ and named
+        #     after a standard library module cannot be imported by the judge;
+        #   - nothing in the working tree is modified, so the diff the gates read is the real one.
+        # The policy read is still the branch's agentic.toml, deliberately, so that a policy change
+        # can be tested by the change that proposes it. The trusted G6 fails any undeclared edit to
+        # it, which is what stops a change granting itself a weaker policy.
         #
-        # This step cannot protect THIS FILE. On a pull_request event the workflow comes from the
-        # PR head, so a PR that edits it decides whether any of this runs. What makes the gate
-        # binding is branch protection with "agentic-gates" as a required status check, plus
-        # CODEOWNERS on .github/workflows/, .agentic/ and agentic.toml. G6 fails a PR that edits a
-        # CI definition which already ran the gate, so the attempt is at least visible.
+        # This step cannot protect THIS FILE: on a pull_request event the workflow comes from the
+        # pull request. What makes the gate binding is a ruleset on the base branch requiring the
+        # "gates" check (the job id, not the workflow name), with "Require review from Code Owners"
+        # enabled and CODEOWNERS covering .github/workflows/, .agentic/ and agentic.toml. A skipped
+        # job counts as a successful required check, so do not add paths-ignore here.
         run: |
           set -euo pipefail
-          echo "policy, runner and CI changes proposed by this pull request:"
-          git diff --stat "origin/${GITHUB_BASE_REF}...HEAD" -- .agentic agentic.toml .github/workflows
-          if git cat-file -e "origin/${GITHUB_BASE_REF}:.agentic/gate.py" 2>/dev/null; then
-            rm -rf .agentic          # checkout overwrites, it does not delete: a PR can ADD files here
-            git checkout "origin/${GITHUB_BASE_REF}" -- .agentic agentic.toml
-            echo "restored .agentic/ and agentic.toml from origin/${GITHUB_BASE_REF}"
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA:.agentic/gate.py" 2>/dev/null; then
+            echo "policy, runner and CI changes proposed by this pull request:"
+            git diff --stat "$BASE_SHA...HEAD" -- .agentic agentic.toml .github/workflows
+            TRUSTED="$RUNNER_TEMP/trusted-gates"
+            mkdir -p "$TRUSTED"
+            git archive "$BASE_SHA" .agentic | tar -x -C "$TRUSTED"
+            echo "judging with .agentic/gate.py as it exists at $BASE_SHA"
+            python "$TRUSTED/.agentic/gate.py" --root . --stage ci --base "$BASE_SHA"
           else
-            echo "the base ref carries no .agentic/gate.py: this pull request is the first install"
+            echo "no runner on the base ref (first install), or not a pull request: using this tree's own"
+            python .agentic/gate.py --stage ci
           fi
-      - name: Run gates
-        run: python .agentic/gate.py --stage ci
-        # GITHUB_BASE_REF / GITHUB_HEAD_REF are read automatically; on push, main is compared to itself
-        # and only the tree-wide checks (G1, G2 run, G4 on untracked) are meaningful.
+        # On push, main is compared to itself and only the tree-wide checks (G1, G2 run, G4 on
+        # untracked) are meaningful. Direct pushes to a protected branch are branch protection's job.
       - name: Upload gate report
         if: always()
         uses: actions/upload-artifact@v4

@@ -17,25 +17,27 @@ steps:
   # Add dependency installs here if tests.command needs them
   - script: |
       set -euo pipefail
-      TARGET=$(echo "$(System.PullRequest.TargetBranch)" | sed 's|refs/heads/||')
-      git fetch -q origin "$TARGET"
-      echo "policy, runner and CI changes proposed by this pull request:"
-      git diff --stat "origin/$TARGET...HEAD" -- .agentic agentic.toml azure-pipelines.yml
-      if git cat-file -e "origin/$TARGET:.agentic/gate.py" 2>/dev/null; then
-        rm -rf .agentic         # checkout overwrites, it does not delete: a PR can ADD files here
-        git checkout "origin/$TARGET" -- .agentic agentic.toml
-        echo "restored .agentic/ and agentic.toml from origin/$TARGET"
+      # A pull request validation build is a merge commit, so its first parent is the exact base
+      # that was merged. That needs no fetch and no persisted credentials, and it does not move if
+      # the target branch advances mid-run.
+      BASE_SHA=$(git rev-parse --verify --quiet "HEAD^1" || true)
+      if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA:.agentic/gate.py" 2>/dev/null; then
+        echo "policy, runner and CI changes proposed by this pull request:"
+        git diff --stat "$BASE_SHA...HEAD" -- .agentic agentic.toml azure-pipelines.yml
+        TRUSTED="$(Agent.TempDirectory)/trusted-gates"
+        mkdir -p "$TRUSTED"
+        git archive "$BASE_SHA" .agentic | tar -x -C "$TRUSTED"
+        echo "judging with .agentic/gate.py as it exists at $BASE_SHA"
+        python "$TRUSTED/.agentic/gate.py" --root . --stage ci --base "$BASE_SHA"
       else
-        echo "the base ref carries no .agentic/gate.py: this pull request is the first install"
+        echo "no runner on the base ref (first install), or not a merge build: using this tree's own"
+        python .agentic/gate.py --stage ci
       fi
-    displayName: restore the gates from the base ref
-    condition: eq(variables['Build.Reason'], 'PullRequest')
-    # The judge must never be the branch's own copy. G6 still reports the edit: it reads the
-    # committed diff as well as the working tree. This step cannot protect this file: the pipeline
-    # definition comes from the branch. Use branch policies and required reviewers on it.
-  - script: python .agentic/gate.py --stage ci
     displayName: agentic gates
-    # System.PullRequest.TargetBranch and SourceBranch are read automatically
+    # The judge must never be the branch's own copy, so the base ref's runner is unpacked outside
+    # the working tree and pointed at it. This cannot protect this file: the pipeline definition
+    # comes from the branch. Use a branch policy that requires this build and required reviewers on
+    # azure-pipelines.yml, .agentic/ and agentic.toml.
   - publish: .agentic/last-report.json
     artifact: agentic-gate-report
     condition: always()

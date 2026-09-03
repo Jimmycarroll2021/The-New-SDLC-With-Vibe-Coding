@@ -63,10 +63,11 @@ mkdir -p your-repo/specs your-repo/handoffs
 cd your-repo && python .agentic/hooks/install_hooks.py
 
 # 4. add CI: copy .github/workflows/agentic-gates.yml or azure-pipelines.yml, add your
-#    dependency install step before "Run gates". Then make it binding: branch protection on
-#    the base branch with the gate job as a REQUIRED status check, and CODEOWNERS on
-#    .github/workflows/, .agentic/ and agentic.toml. Without those two the gate is advice:
-#    a pull request supplies its own workflow file.
+#    dependency install step. Then make it binding, or the gate is advice, because a pull
+#    request supplies its own workflow file: a ruleset on the base branch requiring the
+#    "gates" check by its JOB ID (not the workflow name), "Require review from Code Owners"
+#    switched on, and CODEOWNERS covering .github/workflows/, .agentic/ and agentic.toml.
+#    A skipped job counts as a successful required check, so do not add paths-ignore.
 
 # 5. write the first spec and run
 cp .agentic/templates/SPEC.md specs/SPEC-0001-first-change.md
@@ -134,7 +135,7 @@ AGENTS.md  CLAUDE.md  GEMINI.md  rules, and two one-line pointers to them
 specs/  handoffs/                one file per change, checked by G0 and G5
 docs/GATES.md                    what each gate checks and why
 adapters/                        optional per-tool conveniences
-tests/test_gate.py               41 tests; each builds a real temporary git repo
+tests/test_gate.py               46 tests; each builds a real temporary git repo
 ```
 
 ## What it deliberately does not do

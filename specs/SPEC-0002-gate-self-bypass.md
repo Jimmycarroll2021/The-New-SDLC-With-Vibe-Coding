@@ -58,8 +58,15 @@ Enforcement, honestly split:
 
 | Where | Mechanism | Sound? |
 |---|---|---|
-| CI | the workflow restores `.agentic/` and `agentic.toml` from the base ref, then runs the gates, so the judge is never the branch's copy | yes |
+| CI | the workflow unpacks the base ref's `.agentic/` outside the working tree and runs that copy against the tree with `--root`, so the judge is never the branch's copy | yes, up to the workflow file itself |
 | local, hook, loop | G6 fails on any edit to the runner or the policy that the spec has not declared | no, it is a tripwire |
+
+Unpacking the trusted runner outside the tree rather than restoring it into the tree is what makes
+framework maintenance possible at all: the branch's own tests still import the branch's runner, so a
+change to the runner can be tested by the change that makes it, while the verdict still comes from
+the reviewed copy. The policy read is deliberately the branch's `agentic.toml`, so a policy change
+can be exercised by the change proposing it; the trusted G6 is what stops a change granting itself a
+weaker policy undeclared.
 
 The tripwire is defeated by an author who edits G6 out of the runner in the same change. Nothing
 that runs from inside a branch can defend itself against edits to itself; that is why the CI
@@ -85,12 +92,21 @@ matters.
    the code that computed the verdict was tampered with to say otherwise.
 7. G6 fails when no base ref can be resolved, because with no change set the policy, runner and
    tier checks cannot be performed at all.
-8. The GitHub Actions and Azure Pipelines workflows remove and restore `.agentic/` and restore
-   `agentic.toml` from the base ref on pull request runs, before the gates run, print what they
-   restored, and fail the job rather than continue when the restore does not succeed. Removing the
-   directory rather than overwriting it is what stops a Python file added under `.agentic/` and
-   named after a standard library module from shadowing an import in the runner.
+8. The GitHub Actions and Azure Pipelines workflows unpack the base ref's `.agentic/` into a
+   directory outside the working tree and run that copy with `--root .`, on pull request runs,
+   printing the base commit and the policy, runner and CI changes the change proposes. Unpacking
+   outside the tree is what keeps `sys.path[0]` clean, so a Python file added under `.agentic/` and
+   named after a standard library module cannot be imported by the judge, and what leaves the
+   branch's own tests able to import the branch's runner.
 9. The existing 26 tests still pass, and the framework still passes its own gates on this branch.
+10. G6 sees a protected file that is deleted, renamed out of its protected path, or changed to
+    another file type. `--diff-filter=ACMR` with rename detection reports none of those.
+11. A `Framework maintenance: yes` declaration authorises only the change that adds or modifies the
+    spec carrying it. A declaration merged earlier is not a standing permission.
+12. A CI definition is protected when the change alters the lines that invoke the runner, and not
+    when it alters something else in the same file, such as a Python or action version.
+13. A report whose results do not cover the gates it lists as required is not a pass, because
+    `all([])` is `True`.
 
 ## Out of scope
 
@@ -111,10 +127,23 @@ matters.
   human decision about whether the gate is allowed to touch the network or the environment.
 - **The CI definition itself.** On a pull request event the workflow file comes from the pull
   request head, so a change that edits or deletes it decides whether any of this runs. G6 fails such
-  a change, which makes it visible, but the thing that makes the gate binding is branch protection
-  with the gate job as a required status check plus CODEOWNERS on `.github/workflows/`, `.agentic/`
-  and `agentic.toml`. That is repository configuration, not something a file in the repository can
-  enforce, and it belongs in the install instructions rather than in the runner.
+  a change, which makes it visible, but the thing that makes the gate binding is a base branch
+  ruleset requiring the gate job by its job id, with review from code owners enabled and CODEOWNERS
+  covering `.github/workflows/`, `.agentic/` and `agentic.toml`. That is repository configuration,
+  not something a file in the repository can enforce, and it belongs in the install instructions
+  rather than in the runner. A deterministic trust root would need the workflow to live outside the
+  repository, as an organisation-required workflow.
+- **The bootstrap.** The change that first introduces G6 cannot be judged by G6: the base ref's
+  runner does not have it. That is true of any control on its first landing, and it is why this one
+  is being reviewed by three models and a human rather than by itself.
+- **Merge queues.** There is no `merge_group` trigger, so a repository using a merge queue needs one
+  added, and needs the trusted-runner step taught about that event.
+- **Path quoting outside G6.** The G6 collectors read NUL-delimited paths. `changed_files` and
+  `added_lines` still read line-oriented git output, which `core.quotePath` escapes for unusual
+  names. That is pre-existing and belongs in its own change.
+- **Indirect invocation.** A CI definition that calls the runner through a wrapper script, a make
+  target or a reusable workflow contains no literal `gate.py`, so G6 will not recognise it as part
+  of the judge.
 - **Sandboxing `tests.command` and `evals.command`.** They run the branch's code, by design. A
   branch that ships a test which always passes is the documented S5 case and a code review problem.
 - **Push events.** The restore is guarded on pull request events. A direct push to a protected

@@ -82,12 +82,18 @@ to `agentic.toml` cannot be switched off by editing `agentic.toml`.
 
 ## G6 integrity
 
-- Fails when the change set touches `agentic.toml`, anything under `.agentic/`, or a CI definition
-  that already invoked the runner on the base ref, unless the branch is production tier **and** a
-  referenced spec carries a `Framework maintenance: yes` field, exactly that value and nothing else.
-  The runtime artefacts those tools write, `.agentic/last-report.json`, `.agentic/runs/`,
-  `.agentic/evals/result.json` and compiled Python, are exempt. Deletions count: removing the runner
-  is as hostile as editing it.
+- Fails when the change set touches `agentic.toml`, anything under `.agentic/`, or the lines of a CI
+  definition that invoke the runner, unless the branch is production tier **and** a spec **that this
+  change adds or modifies** carries a `Framework maintenance: yes` field, exactly that value. A
+  declaration merged earlier is not a standing permission. The runtime artefacts those tools write,
+  `.agentic/last-report.json`, `.agentic/runs/`, `.agentic/evals/result.json` and compiled Python,
+  are exempt.
+- Deletions, renames away from a protected path, and file type changes all count. Moving
+  `.agentic/gate.py` elsewhere is as effective as editing it, and `--diff-filter=ACMR` with rename
+  detection reports only the destination.
+- A CI definition is protected by what the change does to its gate invocation, not by the file being
+  touched at all. Bumping a Python version in the same workflow is an ordinary change; deleting the
+  step that runs the gate is not.
 - Fails when the change set touches `paths.source` and the branch is not production tier. The tier
   is an assertion by whoever named the branch; this is the only thing in the repository that can
   contradict it. Renaming a branch to `docs/whatever` used to drop G0, G3 and G5 silently.
@@ -99,24 +105,33 @@ to `agentic.toml` cannot be switched off by editing `agentic.toml`.
   against.
 - Separately, `verdict()` derives the overall pass or fail from the recorded gate statuses, and
   `enforce_verdict()` re-derives it wherever a report is produced or consumed. A report that lists a
-  failure cannot carry a pass verdict.
+  failure cannot carry a pass verdict, and neither can one whose results do not cover the gates it
+  says are required, because `all([])` is `True`.
 
 **What G6 is, honestly.** Locally, in the hook and in `loop.py`, it is a tripwire: a change that
 edits the runner can edit G6 out of the runner in the same commit. Nothing that runs from inside a
 branch can defend itself against edits to itself. The boundary that holds is the CI step that
-restores `.agentic/` and `agentic.toml` from the base ref before running the gates, so the judge is
-never the branch's own copy.
+unpacks the base ref's `.agentic/` outside the working tree and runs that copy against the tree, so
+the judge is never the branch's own copy. It is deliberately not restored *into* the tree: the
+branch's own tests have to be able to import the branch's runner, or no change to the runner could
+ever be tested by the change that makes it.
 
 **What even that does not reach**, established by adversarial review of this change and left open
 deliberately:
 
 - **The CI definition comes from the branch.** On a `pull_request` event GitHub runs the workflow
   file in the PR head, so a PR that edits or deletes it decides whether any of this executes. G6
-  fails such a PR, and the restore step removes and re-checks-out `.agentic/` rather than
-  overwriting it, so an added `.agentic/<stdlib name>.py` cannot shadow an import in the runner. But
-  what makes the gate binding is branch protection with the gate job as a **required status check**,
-  plus **CODEOWNERS** on `.github/workflows/`, `.agentic/` and `agentic.toml`. Without those two,
-  the gate is advice.
+  fails such a PR, and running the trusted runner from outside the tree keeps `sys.path[0]` clean so
+  that an added `.agentic/` module named after a standard library one cannot be imported by the
+  judge. But what makes the gate binding is a base branch ruleset requiring the gate job **by its
+  job id**, with **Require review from Code Owners** enabled and CODEOWNERS covering
+  `.github/workflows/`, `.agentic/` and `agentic.toml`. A skipped job counts as a successful
+  required check. Without that configuration, the gate is advice. A deterministic trust root needs
+  the workflow to live outside the repository, as an organisation-required workflow.
+- **A CI definition that calls the runner indirectly**, through a wrapper script, a make target or a
+  reusable workflow, contains no literal `gate.py` and is not recognised as part of the judge.
+- **The first landing of a control cannot be judged by it.** The base ref's runner has no G6 until
+  this change is merged, so the bootstrap review is human.
 - **`tests.command` and `evals.command` execute the branch's code**, by design: they are your test
   suite and your eval runner. Restoring the policy does not sandbox them. A branch that ships a
   test file which always passes is the S5 case, and is a code review problem, not a gate problem.

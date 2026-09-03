@@ -481,6 +481,46 @@ class Integrity(unittest.TestCase):
         g6 = self.fx.result(self.fx.run(), "G6")
         self.assertEqual(g6["status"], "fail", g6["evidence"])
 
+    def test_g6_sees_the_runner_renamed_out_of_the_way(self):
+        full_production_setup(self.fx)
+        self.fx.commit("the change")
+        git(self.fx.root, "mv", ".agentic/gate.py", "tools_gate.py")
+        self.fx.commit("move the runner out of .agentic")
+        g6 = self.fx.result(self.fx.run(), "G6")
+        self.assertEqual(g6["status"], "fail")
+        self.assertTrue(any(".agentic/gate.py" in e for e in g6["evidence"]), g6["evidence"])
+
+    def test_g6_will_not_reuse_a_maintenance_spec_that_landed_earlier(self):
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC.replace(
+            "Risk tier: production", "Risk tier: production\nFramework maintenance: yes", 1))
+        self.fx.commit("the maintenance declaration landed in an earlier change")
+        self.fx.branch("feature/SPEC-0007-more")
+        self.fx.write(".agentic/gate.py", "# stand-in\n# tampered again\n")
+        g6 = self.fx.result(self.fx.run(), "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+
+    def test_g6_ignores_an_unrelated_edit_to_a_gate_bearing_ci_file(self):
+        full_production_setup(self.fx)
+        self.fx.write(".github/workflows/gates.yml",
+                      "python-version: 3.12\nrun: python .agentic/gate.py --stage ci\n")
+        g6 = self.fx.result(self.fx.run(), "G6")
+        self.assertEqual(g6["status"], "pass", g6["evidence"])
+
+    def test_g6_protects_the_ci_definition_at_commit_stage_too(self):
+        self.fx.branch("feature/SPEC-0007-ci")
+        self.fx.write(".github/workflows/gates.yml", "run: exit 0\n")
+        self.fx.stage(".github/workflows/gates.yml")
+        g6 = self.fx.result(self.fx.run(stage="commit"), "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+
+    def test_a_report_that_omits_a_required_gate_is_not_a_pass(self):
+        rep = gate.enforce_verdict({"ok": True, "required_gates": ["G4", "G6"],
+                                    "results": [{"gate": "G4", "status": "pass"}]})
+        self.assertFalse(rep["ok"])
+        self.assertIn("integrity_error", rep)
+        empty = gate.enforce_verdict({"ok": True, "required_gates": ["G6"], "results": []})
+        self.assertFalse(empty["ok"])           # all([]) is True, and that is not a pass
+
     def test_g6_ignores_runtime_artefacts_under_agentic(self):
         full_production_setup(self.fx)
         self.fx.write(".agentic/last-report.json", "{}\n")

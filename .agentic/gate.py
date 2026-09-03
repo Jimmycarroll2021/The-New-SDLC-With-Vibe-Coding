@@ -211,25 +211,29 @@ class Repo:
         return result
 
     def committed_changed_files(self, base: str | None) -> list[str]:
-        """Commit-to-commit view. CI restores the policy and the runner from the base ref before
-        running, which clears them from the working tree; this is how G6 still sees them."""
+        """Commit-to-commit view, so a CI step that runs a trusted copy of the runner still sees
+        what the branch proposed to do to it. NUL-delimited, because core.quotePath escapes
+        unusual names, and rename detection off, so a rename shows as an add and a delete."""
         mb = self.merge_base(base)
         if not mb:
             return []
-        out = self.git("diff", "--name-only", "--diff-filter=ACMR", f"{mb}..HEAD")
-        return sorted(f for f in out.splitlines() if f.strip())
+        out = self.git("diff", "--no-renames", "-z", "--name-only", "--diff-filter=ACMT",
+                       f"{mb}..HEAD")
+        return sorted(f for f in out.split("\0") if f.strip())
 
-    def deleted_files(self, base: str | None, staged: bool) -> list[str]:
-        """Deleting the runner is as hostile as editing it, and --diff-filter=ACMR hides it."""
+    def vanished_files(self, base: str | None, staged: bool) -> list[str]:
+        """Paths that leave a change: deletions, the source side of a rename away, and type
+        changes such as a file becoming a symlink. Removing the runner, or moving it out of
+        .agentic/, is as hostile as editing it, and --diff-filter=ACMR reports neither."""
+        args = ["diff", "--no-renames", "-z", "--name-only", "--diff-filter=DT"]
         if staged:
-            out = self.git("diff", "--cached", "--name-only", "--diff-filter=D")
+            outs = [self.git(*args, "--cached")]
         else:
             mb = self.merge_base(base)
             if not mb:
                 return []
-            out = (self.git("diff", "--name-only", "--diff-filter=D", mb)
-                   + self.git("diff", "--name-only", "--diff-filter=D", f"{mb}..HEAD"))
-        return sorted({f for f in out.splitlines() if f.strip()})
+            outs = [self.git(*args, mb), self.git(*args, f"{mb}..HEAD")]
+        return sorted({f for o in outs for f in o.split("\0") if f.strip()})
 
     def show(self, ref: str, path: str) -> str:
         return self.git("show", f"{ref}:{path}")
@@ -287,7 +291,8 @@ class Ctx:
     changed: list[str]
     changed_mode: str
     committed: list[str] = field(default_factory=list)
-    deleted: list[str] = field(default_factory=list)
+    vanished: list[str] = field(default_factory=list)
+    merge_base: str | None = None
     tier_override_problem: str | None = None
     _added: dict | None = None
 
@@ -374,13 +379,18 @@ def referenced_spec_ids(ctx: Ctx) -> set[str]:
 
 
 def maintenance_spec(ctx: Ctx) -> str | None:
-    """The referenced spec that declares this change to be framework maintenance, if any."""
-    spec_dir = ctx.cfg_get("paths", "specs", default="specs")
-    for sid in sorted(referenced_spec_ids(ctx)):
-        for spec in sorted((ctx.repo.root / spec_dir).glob(f"**/{sid}*.md")):
-            val = (field_value(read_text(spec) or "", "Framework maintenance") or "").lower().strip("*. ")
-            if val in ("yes", "true"):   # a boolean field, not a sentence to be interpreted
-                return spec.relative_to(ctx.repo.root).as_posix()
+    """The spec THIS change adds or modifies that declares it framework maintenance.
+
+    A spec merged earlier does not authorise a later change: the declaration has to be in the
+    diff under review, or it is not a declaration, it is a standing permission."""
+    spec_dir = ctx.cfg_get("paths", "specs", default="specs").rstrip("/") + "/"
+    changed = {f.replace("\\", "/") for f in list(ctx.changed) + list(ctx.committed)}
+    for rel in sorted(changed):
+        if not rel.startswith(spec_dir) or not rel.endswith(".md"):
+            continue
+        val = (field_value(read_text(ctx.repo.root / rel) or "", "Framework maintenance") or "")
+        if val.lower().strip("* ") in ("yes", "true"):   # a boolean, not a sentence to interpret
+            return rel
     return None
 
 
@@ -723,12 +733,27 @@ def gate_g5_handoff(ctx: Ctx) -> GateResult:
     return _pass("G5", evidence)
 
 
+def gate_invocation_lines(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if "gate.py" in line]
+
+
 def ci_files_running_the_gate(ctx: Ctx, files: list[str]) -> list[str]:
-    """CI definitions in the change set that already invoked the runner on the base ref."""
-    mb = ctx.repo.merge_base(ctx.base)
-    if not mb:
-        return []
-    return [f for f in files if match_any(f, PROTECTED_CI) and "gate.py" in ctx.repo.show(mb, f)]
+    """CI definitions whose invocation of the runner this change alters.
+
+    A definition that invokes the runner decides whether the gates run at all, so changing that
+    decision is a change to the judge. Bumping a Python version or an action version in the same
+    file is not, and failing those would train people to declare maintenance for everything."""
+    ref = ctx.merge_base or "HEAD"
+    out = []
+    for f in files:
+        if not match_any(f, PROTECTED_CI):
+            continue
+        before = gate_invocation_lines(ctx.repo.show(ref, f))
+        if not before:
+            continue                    # it did not run the gate, so this is an ordinary CI change
+        if before != gate_invocation_lines(read_text(ctx.repo.root / f) or ""):
+            out.append(f)
+    return out
 
 
 def gate_g6_integrity(ctx: Ctx) -> GateResult:
@@ -740,15 +765,17 @@ def gate_g6_integrity(ctx: Ctx) -> GateResult:
     problems, evidence = [], []
     if ctx.tier_override_problem:
         problems.append(ctx.tier_override_problem)
-    if ctx.changed_mode.startswith("no base resolvable"):
+    if ctx.stage == "commit":
+        change_set = sorted(set(ctx.changed) | set(ctx.vanished))
+    elif ctx.merge_base is None:
         problems.append("no base ref resolvable: with no change set, neither the policy, the runner "
                         "nor the tier can be checked against the diff. Fetch the base branch, or pass --base.")
-        change_set: list[str] = []
+        change_set = []
     elif "whole-tree audit" in ctx.changed_mode:
         evidence.append(f"nothing differs from {ctx.base}: the policy, runner and tier checks are vacuous")
         change_set = []
     else:
-        change_set = sorted(set(ctx.changed) | set(ctx.committed) | set(ctx.deleted))
+        change_set = sorted(set(ctx.changed) | set(ctx.committed) | set(ctx.vanished))
     protected = sorted(set(f for f in change_set if is_protected(f))
                        | set(ci_files_running_the_gate(ctx, change_set)))
     if protected:
@@ -801,7 +828,14 @@ def enforce_verdict(rep: dict) -> dict:
     failure can never carry a pass, however the value in it was computed. This is what a runner
     edited to say ok = True runs into."""
     ok = verdict(rep.get("results", []))
-    if rep.get("ok") and not ok:
+    got = [r.get("gate") for r in rep.get("results", [])]
+    required = list(rep.get("required_gates", []))
+    if required and sorted(got) != sorted(set(required)):
+        rep["integrity_error"] = (f"the report does not cover the gates it says are required: "
+                                  f"required {sorted(set(required))}, recorded {sorted(got)}. "
+                                  "all([]) is True, so an empty result set is not a pass")
+        ok = False
+    elif rep.get("ok") and not ok:
         rep["integrity_error"] = ("the runner reported a pass while the report records a failure: "
                                   ".agentic/gate.py has been modified or is corrupt")
     rep["ok"] = ok
@@ -836,7 +870,7 @@ def run(root: Path, stage: str, base: str | None, tier_override: str | None) -> 
     changed, mode = repo.changed_files(base, stage == "commit")
     ctx = Ctx(repo, cfg, stage, base, tier, branch, changed, mode,
               committed=repo.committed_changed_files(base), tier_override_problem=tier_problem,
-              deleted=repo.deleted_files(base, stage == "commit"))
+              vanished=repo.vanished_files(base, stage == "commit"), merge_base=repo.merge_base(base))
     default = [g for g in GATES if g != "G6"]
     required = list(cfg.get("tiers", {}).get("required", {}).get(tier, default))
     if stage == "commit":
