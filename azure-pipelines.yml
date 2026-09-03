@@ -16,17 +16,23 @@ steps:
       versionSpec: "3.11"
   # Add dependency installs here if tests.command needs them
   - script: |
-      set -e
+      set -euo pipefail
       TARGET=$(echo "$(System.PullRequest.TargetBranch)" | sed 's|refs/heads/||')
       git fetch -q origin "$TARGET"
-      echo "policy and runner changes proposed by this pull request:"
-      git diff --stat "origin/$TARGET...HEAD" -- .agentic agentic.toml
-      git checkout "origin/$TARGET" -- .agentic agentic.toml \
-        || echo "the base ref carries no .agentic/ or agentic.toml yet: first install"
+      echo "policy, runner and CI changes proposed by this pull request:"
+      git diff --stat "origin/$TARGET...HEAD" -- .agentic agentic.toml azure-pipelines.yml
+      if git cat-file -e "origin/$TARGET:.agentic/gate.py" 2>/dev/null; then
+        rm -rf .agentic         # checkout overwrites, it does not delete: a PR can ADD files here
+        git checkout "origin/$TARGET" -- .agentic agentic.toml
+        echo "restored .agentic/ and agentic.toml from origin/$TARGET"
+      else
+        echo "the base ref carries no .agentic/gate.py: this pull request is the first install"
+      fi
     displayName: restore the gates from the base ref
     condition: eq(variables['Build.Reason'], 'PullRequest')
     # The judge must never be the branch's own copy. G6 still reports the edit: it reads the
-    # committed diff as well as the working tree.
+    # committed diff as well as the working tree. This step cannot protect this file: the pipeline
+    # definition comes from the branch. Use branch policies and required reviewers on it.
   - script: python .agentic/gate.py --stage ci
     displayName: agentic gates
     # System.PullRequest.TargetBranch and SourceBranch are read automatically

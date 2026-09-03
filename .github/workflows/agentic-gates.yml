@@ -21,11 +21,23 @@ jobs:
         # The judge must never be the branch's own copy: a PR that rewrites agentic.toml or gate.py
         # would otherwise be graded by its own rewrite. G6 still reports the edit, because it reads
         # the committed diff as well as the working tree.
+        #
+        # This step cannot protect THIS FILE. On a pull_request event the workflow comes from the
+        # PR head, so a PR that edits it decides whether any of this runs. What makes the gate
+        # binding is branch protection with "agentic-gates" as a required status check, plus
+        # CODEOWNERS on .github/workflows/, .agentic/ and agentic.toml. G6 fails a PR that edits a
+        # CI definition which already ran the gate, so the attempt is at least visible.
         run: |
-          echo "policy and runner changes proposed by this pull request:"
-          git diff --stat "origin/${GITHUB_BASE_REF}...HEAD" -- .agentic agentic.toml
-          git checkout "origin/${GITHUB_BASE_REF}" -- .agentic agentic.toml \
-            || echo "the base ref carries no .agentic/ or agentic.toml yet: first install"
+          set -euo pipefail
+          echo "policy, runner and CI changes proposed by this pull request:"
+          git diff --stat "origin/${GITHUB_BASE_REF}...HEAD" -- .agentic agentic.toml .github/workflows
+          if git cat-file -e "origin/${GITHUB_BASE_REF}:.agentic/gate.py" 2>/dev/null; then
+            rm -rf .agentic          # checkout overwrites, it does not delete: a PR can ADD files here
+            git checkout "origin/${GITHUB_BASE_REF}" -- .agentic agentic.toml
+            echo "restored .agentic/ and agentic.toml from origin/${GITHUB_BASE_REF}"
+          else
+            echo "the base ref carries no .agentic/gate.py: this pull request is the first install"
+          fi
       - name: Run gates
         run: python .agentic/gate.py --stage ci
         # GITHUB_BASE_REF / GITHUB_HEAD_REF are read automatically; on push, main is compared to itself

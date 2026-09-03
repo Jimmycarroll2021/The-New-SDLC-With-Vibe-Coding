@@ -122,6 +122,7 @@ class RepoFixture:
         self.write("AGENTS.md", GOOD_AGENTS)
         self.write("README.md", "hello\n")
         self.write(".agentic/gate.py", "# stand-in for the runner, so G6 has something to protect\n")
+        self.write(".github/workflows/gates.yml", "run: python .agentic/gate.py --stage ci\n")
         git(self.root, "add", "-A")
         git(self.root, "commit", "-q", "-m", "init")
 
@@ -448,6 +449,37 @@ class Integrity(unittest.TestCase):
         g6 = self.fx.result(self.fx.run(), "G6")
         self.assertEqual(g6["status"], "fail")
         self.assertTrue(any("internal" in e for e in g6["evidence"]), g6["evidence"])
+
+    def test_g6_protects_a_ci_definition_that_already_ran_the_gate(self):
+        full_production_setup(self.fx)
+        self.fx.write(".github/workflows/gates.yml", "run: exit 0   # gates deleted\n")
+        g6 = self.fx.result(self.fx.run(), "G6")
+        self.assertEqual(g6["status"], "fail")
+        self.assertTrue(any("gates.yml" in e for e in g6["evidence"]), g6["evidence"])
+
+    def test_g6_leaves_an_unrelated_new_workflow_alone(self):
+        full_production_setup(self.fx)
+        self.fx.write(".github/workflows/deploy.yml", "run: ./deploy.sh\n")
+        g6 = self.fx.result(self.fx.run(), "G6")
+        self.assertEqual(g6["status"], "pass", g6["evidence"])
+
+    def test_g6_sees_the_runner_deleted_as_well_as_edited(self):
+        full_production_setup(self.fx)
+        self.fx.commit("the change")
+        git(self.fx.root, "rm", "-q", ".agentic/gate.py")
+        self.fx.commit("delete the runner")
+        g6 = self.fx.result(self.fx.run(), "G6")
+        self.assertEqual(g6["status"], "fail")
+        self.assertTrue(any(".agentic/gate.py" in e for e in g6["evidence"]), g6["evidence"])
+
+    def test_g6_maintenance_declaration_is_a_boolean_not_a_sentence(self):
+        full_production_setup(self.fx)
+        self.fx.write(".agentic/gate.py", "# stand-in\n# tampered\n")
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC.replace(
+            "Risk tier: production",
+            "Risk tier: production\nFramework maintenance: yes, and G0 does not apply either", 1))
+        g6 = self.fx.result(self.fx.run(), "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
 
     def test_g6_ignores_runtime_artefacts_under_agentic(self):
         full_production_setup(self.fx)

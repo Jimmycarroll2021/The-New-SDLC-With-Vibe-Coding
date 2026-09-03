@@ -82,10 +82,12 @@ to `agentic.toml` cannot be switched off by editing `agentic.toml`.
 
 ## G6 integrity
 
-- Fails when the change set touches `agentic.toml` or anything under `.agentic/`, unless the branch
-  is production tier **and** a referenced spec carries a `Framework maintenance: yes` field. The
-  runtime artefacts those tools write, `.agentic/last-report.json`, `.agentic/runs/`,
-  `.agentic/evals/result.json` and compiled Python, are exempt.
+- Fails when the change set touches `agentic.toml`, anything under `.agentic/`, or a CI definition
+  that already invoked the runner on the base ref, unless the branch is production tier **and** a
+  referenced spec carries a `Framework maintenance: yes` field, exactly that value and nothing else.
+  The runtime artefacts those tools write, `.agentic/last-report.json`, `.agentic/runs/`,
+  `.agentic/evals/result.json` and compiled Python, are exempt. Deletions count: removing the runner
+  is as hostile as editing it.
 - Fails when the change set touches `paths.source` and the branch is not production tier. The tier
   is an assertion by whoever named the branch; this is the only thing in the repository that can
   contradict it. Renaming a branch to `docs/whatever` used to drop G0, G3 and G5 silently.
@@ -103,7 +105,30 @@ to `agentic.toml` cannot be switched off by editing `agentic.toml`.
 edits the runner can edit G6 out of the runner in the same commit. Nothing that runs from inside a
 branch can defend itself against edits to itself. The boundary that holds is the CI step that
 restores `.agentic/` and `agentic.toml` from the base ref before running the gates, so the judge is
-never the branch's own copy. Put CODEOWNERS on both paths in any repository that matters.
+never the branch's own copy.
+
+**What even that does not reach**, established by adversarial review of this change and left open
+deliberately:
+
+- **The CI definition comes from the branch.** On a `pull_request` event GitHub runs the workflow
+  file in the PR head, so a PR that edits or deletes it decides whether any of this executes. G6
+  fails such a PR, and the restore step removes and re-checks-out `.agentic/` rather than
+  overwriting it, so an added `.agentic/<stdlib name>.py` cannot shadow an import in the runner. But
+  what makes the gate binding is branch protection with the gate job as a **required status check**,
+  plus **CODEOWNERS** on `.github/workflows/`, `.agentic/` and `agentic.toml`. Without those two,
+  the gate is advice.
+- **`tests.command` and `evals.command` execute the branch's code**, by design: they are your test
+  suite and your eval runner. Restoring the policy does not sandbox them. A branch that ships a
+  test file which always passes is the S5 case, and is a code review problem, not a gate problem.
+- **Push events are not restored.** The restore is guarded on pull request events; a direct push to
+  a protected branch is outside the model, which is what branch protection is for.
+- **A pull request that relaxes policy is judged by the policy it is replacing**, because CI
+  restores `agentic.toml` from the base ref. That is deliberate, and it means a policy relaxation
+  must still satisfy the old rules to land. If the old policy is unsatisfiable, the maintainer has
+  to land the policy change on its own, which is exactly the conversation that should happen.
+- **`Framework maintenance: yes` is self-issued.** It is a declaration in a file the same change
+  adds, so it stops drift, not a determined author. Its value is that the claim is in the diff, in
+  a spec, where a human reviewing the pull request has to read it.
 
 ## What the gates deliberately do not do
 

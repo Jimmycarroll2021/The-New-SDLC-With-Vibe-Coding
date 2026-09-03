@@ -70,11 +70,13 @@ matters.
 
 1. G6 appears in every report at every tier and every stage, and cannot be removed by
    `agentic.toml`. Covered by `tests/test_gate.py`.
-2. G6 fails when the change set touches `agentic.toml` or any file under `.agentic/`, excluding
-   the runtime artefacts `.agentic/last-report.json`, `.agentic/runs/`, `.agentic/evals/result.json`
-   and compiled Python.
+2. G6 fails when the change set touches `agentic.toml`, any file under `.agentic/`, or a CI
+   definition that already invoked the runner on the base ref, excluding the runtime artefacts
+   `.agentic/last-report.json`, `.agentic/runs/`, `.agentic/evals/result.json` and compiled Python.
+   Deletions count as changes; a CI definition that did not previously run the gate does not.
 3. G6 allows that same change when the branch tier is production and a referenced spec carries a
-   `Framework maintenance: yes` field, and records which spec declared it as evidence.
+   `Framework maintenance: yes` field, exactly that value and not a sentence containing it, and
+   records which spec declared it as evidence.
 4. G6 fails when the change set touches `paths.source` and the branch tier is not production, and
    names the branch, the tier and the offending files.
 5. `--tier` may raise the tier above the one the branch name implies and may not lower it. A lower
@@ -83,8 +85,11 @@ matters.
    the code that computed the verdict was tampered with to say otherwise.
 7. G6 fails when no base ref can be resolved, because with no change set the policy, runner and
    tier checks cannot be performed at all.
-8. The GitHub Actions and Azure Pipelines workflows restore `.agentic/` and `agentic.toml` from the
-   base ref on pull request runs, before the gates run, and print what they restored.
+8. The GitHub Actions and Azure Pipelines workflows remove and restore `.agentic/` and restore
+   `agentic.toml` from the base ref on pull request runs, before the gates run, print what they
+   restored, and fail the job rather than continue when the restore does not succeed. Removing the
+   directory rather than overwriting it is what stops a Python file added under `.agentic/` and
+   named after a standard library module from shadowing an import in the runner.
 9. The existing 26 tests still pass, and the framework still passes its own gates on this branch.
 
 ## Out of scope
@@ -104,6 +109,16 @@ matters.
 - **Gap 4 from the stress test**, that G4 checks an import is declared rather than that it exists,
   and gaps 5 and 6, hollow spec sections and obfuscated secrets. Separate specs, and gap 4 needs a
   human decision about whether the gate is allowed to touch the network or the environment.
+- **The CI definition itself.** On a pull request event the workflow file comes from the pull
+  request head, so a change that edits or deletes it decides whether any of this runs. G6 fails such
+  a change, which makes it visible, but the thing that makes the gate binding is branch protection
+  with the gate job as a required status check plus CODEOWNERS on `.github/workflows/`, `.agentic/`
+  and `agentic.toml`. That is repository configuration, not something a file in the repository can
+  enforce, and it belongs in the install instructions rather than in the runner.
+- **Sandboxing `tests.command` and `evals.command`.** They run the branch's code, by design. A
+  branch that ships a test which always passes is the documented S5 case and a code review problem.
+- **Push events.** The restore is guarded on pull request events. A direct push to a protected
+  branch is what branch protection is for.
 - Any skip, force or override flag. There is still no way to turn a gate off.
 
 ## Risk tier

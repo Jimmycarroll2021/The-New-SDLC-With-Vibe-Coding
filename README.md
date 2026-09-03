@@ -30,7 +30,7 @@ The last line is the point. A gate says pass or fail with evidence. It never say
 | **G3 evals** | an AI-surface change scores below the bar, has too few cases, no rubric, or a stub target | "evals verify the parts that are not deterministic"; "the bar is the eval, not the demo" |
 | **G4 review** | a secret pattern in an added line, a `.env`/`.pem` in the diff, or an import that is not stdlib, local, or declared | "check imports for real packages"; the hook that blocks the hard-coded password |
 | **G5 handoff** | no `handoffs/HANDOFF-*.md` in the change, or a required field is a placeholder | "traces of every agent run"; "clear handoff protocols" |
-| **G6 integrity** | the change edits `agentic.toml` or `.agentic/` without a spec that declares framework maintenance, a low-tier branch carries production source, `--tier` is used to lower the tier, or no base ref resolves | a control point an agent can rewrite is not a control point |
+| **G6 integrity** | the change edits `agentic.toml`, `.agentic/` or a CI definition that runs the gate, without a spec that declares framework maintenance; a low-tier branch carries production source; `--tier` is used to lower the tier; or no base ref resolves | a control point an agent can rewrite is not a control point |
 
 Which gates apply is decided by **risk tier**, derived from the branch name in `agentic.toml`:
 
@@ -63,7 +63,10 @@ mkdir -p your-repo/specs your-repo/handoffs
 cd your-repo && python .agentic/hooks/install_hooks.py
 
 # 4. add CI: copy .github/workflows/agentic-gates.yml or azure-pipelines.yml, add your
-#    dependency install step before "Run gates"
+#    dependency install step before "Run gates". Then make it binding: branch protection on
+#    the base branch with the gate job as a REQUIRED status check, and CODEOWNERS on
+#    .github/workflows/, .agentic/ and agentic.toml. Without those two the gate is advice:
+#    a pull request supplies its own workflow file.
 
 # 5. write the first spec and run
 cp .agentic/templates/SPEC.md specs/SPEC-0001-first-change.md
@@ -131,7 +134,7 @@ AGENTS.md  CLAUDE.md  GEMINI.md  rules, and two one-line pointers to them
 specs/  handoffs/                one file per change, checked by G0 and G5
 docs/GATES.md                    what each gate checks and why
 adapters/                        optional per-tool conveniences
-tests/test_gate.py               37 tests; each builds a real temporary git repo
+tests/test_gate.py               41 tests; each builds a real temporary git repo
 ```
 
 ## What it deliberately does not do

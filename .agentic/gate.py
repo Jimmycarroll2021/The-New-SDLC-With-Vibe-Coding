@@ -45,6 +45,11 @@ TIER_RANK = {"prototype": 0, "internal": 1, "production": 2}
 # no key in agentic.toml: a check that detects edits to agentic.toml cannot live in agentic.toml.
 PROTECTED_FILES = ("agentic.toml",)
 PROTECTED_DIRS = (".agentic/",)
+# A CI definition that invokes the runner decides whether the gates run at all, so it is part
+# of the judge. Only the ones that already ran it on the base ref count, so an unrelated new
+# workflow is not swept up.
+PROTECTED_CI = [".github/workflows/**", ".gitlab-ci.yml", ".circleci/config.yml",
+                "azure-pipelines.yml", "Jenkinsfile"]
 PROTECTED_RUNTIME = [".agentic/last-report.json", ".agentic/runs/**", ".agentic/evals/result.json",
                      "**/__pycache__/**", "*.pyc"]
 PLACEHOLDER = re.compile(r"^\s*(<[^>]*>|TBD|TODO|\.\.\.|n/?a)?\s*$", re.I)
@@ -214,6 +219,21 @@ class Repo:
         out = self.git("diff", "--name-only", "--diff-filter=ACMR", f"{mb}..HEAD")
         return sorted(f for f in out.splitlines() if f.strip())
 
+    def deleted_files(self, base: str | None, staged: bool) -> list[str]:
+        """Deleting the runner is as hostile as editing it, and --diff-filter=ACMR hides it."""
+        if staged:
+            out = self.git("diff", "--cached", "--name-only", "--diff-filter=D")
+        else:
+            mb = self.merge_base(base)
+            if not mb:
+                return []
+            out = (self.git("diff", "--name-only", "--diff-filter=D", mb)
+                   + self.git("diff", "--name-only", "--diff-filter=D", f"{mb}..HEAD"))
+        return sorted({f for f in out.splitlines() if f.strip()})
+
+    def show(self, ref: str, path: str) -> str:
+        return self.git("show", f"{ref}:{path}")
+
     def is_tracked(self, rel: str) -> bool:
         return bool(self.git("ls-files", "--error-unmatch", rel).strip())
 
@@ -245,11 +265,13 @@ def match_any(path: str, globs: list[str]) -> bool:
 
 
 def is_protected(path: str) -> bool:
-    """True for the policy and the runner, false for the artefacts they write at run time."""
-    p = path.replace("\\", "/")
+    """True for the policy and the runner, false for the artefacts they write at run time.
+    Case-folded: on a case-insensitive filesystem Agentic.toml is the same file."""
+    p = path.replace("\\", "/").lower()
     if match_any(p, PROTECTED_RUNTIME):
         return False
-    return p in PROTECTED_FILES or p.startswith(PROTECTED_DIRS)
+    return (p in PROTECTED_FILES or p.startswith(PROTECTED_DIRS)
+            or p in tuple(d.rstrip("/") for d in PROTECTED_DIRS))
 
 
 # ----------------------------------------------------------------------------- context
@@ -265,6 +287,7 @@ class Ctx:
     changed: list[str]
     changed_mode: str
     committed: list[str] = field(default_factory=list)
+    deleted: list[str] = field(default_factory=list)
     tier_override_problem: str | None = None
     _added: dict | None = None
 
@@ -355,8 +378,8 @@ def maintenance_spec(ctx: Ctx) -> str | None:
     spec_dir = ctx.cfg_get("paths", "specs", default="specs")
     for sid in sorted(referenced_spec_ids(ctx)):
         for spec in sorted((ctx.repo.root / spec_dir).glob(f"**/{sid}*.md")):
-            val = (field_value(read_text(spec) or "", "Framework maintenance") or "").lower().strip("* ")
-            if val.startswith(("yes", "true")):
+            val = (field_value(read_text(spec) or "", "Framework maintenance") or "").lower().strip("*. ")
+            if val in ("yes", "true"):   # a boolean field, not a sentence to be interpreted
                 return spec.relative_to(ctx.repo.root).as_posix()
     return None
 
@@ -700,6 +723,14 @@ def gate_g5_handoff(ctx: Ctx) -> GateResult:
     return _pass("G5", evidence)
 
 
+def ci_files_running_the_gate(ctx: Ctx, files: list[str]) -> list[str]:
+    """CI definitions in the change set that already invoked the runner on the base ref."""
+    mb = ctx.repo.merge_base(ctx.base)
+    if not mb:
+        return []
+    return [f for f in files if match_any(f, PROTECTED_CI) and "gate.py" in ctx.repo.show(mb, f)]
+
+
 def gate_g6_integrity(ctx: Ctx) -> GateResult:
     """The change may not set the rules it is judged by, nor understate its own risk tier.
 
@@ -717,15 +748,17 @@ def gate_g6_integrity(ctx: Ctx) -> GateResult:
         evidence.append(f"nothing differs from {ctx.base}: the policy, runner and tier checks are vacuous")
         change_set = []
     else:
-        change_set = sorted(set(ctx.changed) | set(ctx.committed))
-    protected = [f for f in change_set if is_protected(f)]
+        change_set = sorted(set(ctx.changed) | set(ctx.committed) | set(ctx.deleted))
+    protected = sorted(set(f for f in change_set if is_protected(f))
+                       | set(ci_files_running_the_gate(ctx, change_set)))
     if protected:
         declared = maintenance_spec(ctx)
         if ctx.tier != "production":
             problems.append(f"{protected[:6]}: the policy and the runner may not be changed from a "
                             f"'{ctx.tier}' branch. Framework maintenance is production work.")
         elif declared is None:
-            problems.append(f"{protected[:6]}: this change edits the policy or the runner that judges it. "
+            problems.append(f"{protected[:6]}: this change edits the policy, the runner or the CI "
+                            "definition that judges it. "
                             "If it is deliberate framework maintenance, say so in the spec with a "
                             "'Framework maintenance: yes' field so that a human reviews it. CI restores "
                             "both from the base ref before running the gates.")
@@ -802,7 +835,8 @@ def run(root: Path, stage: str, base: str | None, tier_override: str | None) -> 
                 base = None
     changed, mode = repo.changed_files(base, stage == "commit")
     ctx = Ctx(repo, cfg, stage, base, tier, branch, changed, mode,
-              committed=repo.committed_changed_files(base), tier_override_problem=tier_problem)
+              committed=repo.committed_changed_files(base), tier_override_problem=tier_problem,
+              deleted=repo.deleted_files(base, stage == "commit"))
     default = [g for g in GATES if g != "G6"]
     required = list(cfg.get("tiers", {}).get("required", {}).get(tier, default))
     if stage == "commit":
