@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 560" width="1180" height="560" role="img" aria-label="Vibe coding, structured AI-assisted coding and agentic engineering as three rows. The probabilistic model box is identical in all three; only the deterministic scaffolding around it differs.">
+  <rect x="0" y="0" width="1180" height="560" fill="#F2F4F6"/>
+  <style>
+    .d-box{fill:#FFFFFF;stroke:#1D5E7A;stroke-width:1.5}
+    .d-box-ai{fill:#F1E6D4;stroke:#8A5A1F;stroke-width:1.5;stroke-dasharray:5 3}
+    .d-box-ext{fill:#E9EDF1;stroke:#5C6B78;stroke-width:1.3}
+    .d-box-dec{fill:#FFFFFF;stroke:#131C24;stroke-width:2}
+    .d-line{stroke:#131C24;stroke-width:1.4;fill:none}
+    .d-line-flag{stroke:#A63D2F;stroke-width:1.8;fill:none}
+    .d-head{fill:#131C24;font-family:Archivo,"Helvetica Neue",Arial,sans-serif;font-size:12px;font-weight:700;letter-spacing:.06em}
+    .d-t{fill:#131C24;font-family:Archivo,"Helvetica Neue",Arial,sans-serif;font-size:13px;font-weight:600}
+    .d-s{fill:#5C6B78;font-family:"IBM Plex Mono",ui-monospace,Consolas,Menlo,monospace;font-size:10.5px}
+    .d-l{fill:#5C6B78;font-family:"IBM Plex Mono",ui-monospace,Consolas,Menlo,monospace;font-size:10px}
+    .d-l-em{fill:#1D5E7A;font-family:"IBM Plex Mono",ui-monospace,Consolas,Menlo,monospace;font-size:10px}
+    .d-flag-t{fill:#A63D2F;font-family:"IBM Plex Mono",ui-monospace,Consolas,Menlo,monospace;font-size:10.5px}
+    .d-pass-t{fill:#2E6B4F;font-family:"IBM Plex Mono",ui-monospace,Consolas,Menlo,monospace;font-size:10.5px}
+    .d-fill-ink{fill:#131C24}
+    .d-fill-flag{fill:#A63D2F}
+  </style>
+
+      <defs>
+        <marker id="ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" class="d-fill-ink"/>
+        </marker>
+        <marker id="ar1f" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" class="d-fill-flag"/>
+        </marker>
+      </defs>
+
+      <text x="12" y="40" class="d-head">VIBE</text>
+      <text x="12" y="56" class="d-head">CODING</text>
+      <text x="12" y="76" class="d-s">no structure</text>
+
+      <rect x="170" y="24" width="134" height="48" rx="3" class="d-box-ext"/>
+      <text x="237" y="44" class="d-t" text-anchor="middle">casual prompt</text>
+      <text x="237" y="61" class="d-s" text-anchor="middle">natural language</text>
+      <line x1="304" y1="48" x2="334" y2="48" class="d-line" marker-end="url(#ar1)"/>
+      <rect x="336" y="24" width="134" height="48" rx="3" class="d-box-ai"/>
+      <text x="403" y="44" class="d-t" text-anchor="middle">MODEL</text>
+      <text x="403" y="61" class="d-s" text-anchor="middle">probabilistic</text>
+      <line x1="470" y1="48" x2="500" y2="48" class="d-line" marker-end="url(#ar1)"/>
+      <rect x="502" y="24" width="134" height="48" rx="3" class="d-box"/>
+      <text x="569" y="44" class="d-t" text-anchor="middle">code</text>
+      <text x="569" y="61" class="d-s" text-anchor="middle">multi-file diff</text>
+      <line x1="636" y1="48" x2="666" y2="48" class="d-line" marker-end="url(#ar1)"/>
+      <rect x="668" y="24" width="134" height="48" rx="3" class="d-box-ext"/>
+      <text x="735" y="44" class="d-t" text-anchor="middle">ship</text>
+      <text x="735" y="61" class="d-s" text-anchor="middle">seems to work</text>
+      <path d="M569,72 L569,104 L403,104 L403,74" class="d-line-flag" stroke-dasharray="6 4" marker-end="url(#ar1f)"/>
+      <text x="486" y="122" class="d-flag-t" text-anchor="middle">paste the error back; nothing asserts the fix</text>
+
+      <text x="12" y="176" class="d-head">STRUCTURED</text>
+      <text x="12" y="192" class="d-head">AI-ASSISTED</text>
+      <text x="12" y="212" class="d-s">human checkpoints</text>
+
+      <rect x="170" y="160" width="134" height="48" rx="3" class="d-box-ext"/>
+      <text x="237" y="180" class="d-t" text-anchor="middle">detailed prompt</text>
+      <text x="237" y="197" class="d-s" text-anchor="middle">+ examples</text>
+      <line x1="304" y1="184" x2="334" y2="184" class="d-line" marker-end="url(#ar1)"/>
+      <rect x="336" y="160" width="134" height="48" rx="3" class="d-box-ai"/>
+      <text x="403" y="180" class="d-t" text-anchor="middle">MODEL</text>
+      <text x="403" y="197" class="d-s" text-anchor="middle">probabilistic</text>
+      <line x1="470" y1="184" x2="500" y2="184" class="d-line" marker-end="url(#ar1)"/>
+      <rect x="502" y="160" width="134" height="48" rx="3" class="d-box"/>
+      <text x="569" y="180" class="d-t" text-anchor="middle">code</text>
+      <text x="569" y="197" class="d-s" text-anchor="middle">multi-file diff</text>
+      <line x1="636" y1="184" x2="666" y2="184" class="d-line" marker-end="url(#ar1)"/>
+      <rect x="668" y="160" width="134" height="48" rx="3" class="d-box-ext"/>
+      <text x="735" y="180" class="d-t" text-anchor="middle">manual review</text>
+      <text x="735" y="197" class="d-s" text-anchor="middle">critical paths</text>
+      <line x1="802" y1="184" x2="832" y2="184" class="d-line" marker-end="url(#ar1)"/>
+      <rect x="834" y="160" width="134" height="48" rx="3" class="d-box-ext"/>
+      <text x="901" y="180" class="d-t" text-anchor="middle">ship</text>
+      <text x="901" y="197" class="d-s" text-anchor="middle">human judgement</text>
+      <path d="M735,208 L735,240 L403,240 L403,210" class="d-line" stroke-dasharray="6 4" marker-end="url(#ar1)"/>
+      <text x="569" y="258" class="d-s" text-anchor="middle">developer diagnoses the root cause, the model implements the fix</text>
+
+      <text x="12" y="336" class="d-head">AGENTIC</text>
+      <text x="12" y="352" class="d-head">ENGINEERING</text>
+      <text x="12" y="372" class="d-s">gates, not opinion</text>
+
+      <rect x="170" y="316" width="134" height="48" rx="3" class="d-box"/>
+      <text x="237" y="336" class="d-t" text-anchor="middle">spec + AGENTS.md</text>
+      <text x="237" y="353" class="d-l-em" text-anchor="middle">architecture doc</text>
+      <line x1="304" y1="340" x2="334" y2="340" class="d-line" marker-end="url(#ar1)"/>
+      <rect x="336" y="316" width="134" height="48" rx="3" class="d-box-ai"/>
+      <text x="403" y="336" class="d-t" text-anchor="middle">MODEL</text>
+      <text x="403" y="353" class="d-s" text-anchor="middle">probabilistic</text>
+      <line x1="470" y1="340" x2="500" y2="340" class="d-line" marker-end="url(#ar1)"/>
+      <rect x="502" y="316" width="134" height="48" rx="3" class="d-box"/>
+      <text x="569" y="336" class="d-t" text-anchor="middle">code</text>
+      <text x="569" y="353" class="d-s" text-anchor="middle">multi-file diff</text>
+
+      <path d="M636,340 L652,340 L652,300 L666,300" class="d-line" marker-end="url(#ar1)"/>
+      <path d="M636,340 L652,340 L652,384 L666,384" class="d-line" marker-end="url(#ar1)"/>
+      <rect x="668" y="278" width="134" height="44" rx="3" class="d-box"/>
+      <text x="735" y="296" class="d-t" text-anchor="middle">tests</text>
+      <text x="735" y="312" class="d-s" text-anchor="middle">deterministic parts</text>
+      <rect x="668" y="362" width="134" height="44" rx="3" class="d-box-ai"/>
+      <text x="735" y="380" class="d-t" text-anchor="middle">evals</text>
+      <text x="735" y="396" class="d-s" text-anchor="middle">LM judge, rubric</text>
+
+      <path d="M802,300 L818,300 L818,330 L832,330" class="d-line" marker-end="url(#ar1)"/>
+      <path d="M802,384 L818,384 L818,350 L832,350" class="d-line" marker-end="url(#ar1)"/>
+      <rect x="834" y="316" width="134" height="48" rx="3" class="d-box-dec"/>
+      <text x="901" y="336" class="d-t" text-anchor="middle">CI/CD gate</text>
+      <text x="901" y="353" class="d-s" text-anchor="middle">both must pass</text>
+      <line x1="968" y1="340" x2="998" y2="340" class="d-line" marker-end="url(#ar1)"/>
+      <text x="984" y="330" class="d-pass-t" text-anchor="middle">pass</text>
+      <rect x="1000" y="316" width="134" height="48" rx="3" class="d-box"/>
+      <text x="1067" y="336" class="d-t" text-anchor="middle">merge</text>
+      <text x="1067" y="353" class="d-pass-t" text-anchor="middle">ready to ship</text>
+      <path d="M901,364 L901,440 L403,440 L403,366" class="d-line" marker-end="url(#ar1)"/>
+      <text x="652" y="458" class="d-s" text-anchor="middle">orchestration captures the failure and routes it back, in minutes, with no human in the path</text>
+
+      <rect x="170" y="500" width="18" height="14" rx="2" class="d-box"/>
+      <text x="196" y="512" class="d-l">deterministic: you can predict the output</text>
+      <rect x="520" y="500" width="18" height="14" rx="2" class="d-box-ai"/>
+      <text x="546" y="512" class="d-l">probabilistic: a rerun can differ</text>
+      <rect x="830" y="500" width="18" height="14" rx="2" class="d-box-ext"/>
+      <text x="856" y="512" class="d-l">human or manual</text>
+      <line x1="170" y1="534" x2="200" y2="534" class="d-line-flag" stroke-dasharray="6 4"/>
+      <text x="208" y="538" class="d-l">rework loop with nothing asserting the fix</text>
+    
+</svg>
