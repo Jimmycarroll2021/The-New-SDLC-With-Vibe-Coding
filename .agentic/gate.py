@@ -597,12 +597,14 @@ def gate_g4_review(ctx: Ctx) -> GateResult:
             problems.append(f"{f}: secret-bearing file type in the change set")
     evidence.append(f"secret scan: {sum(len(v) for v in ctx.added.values())} added lines across {len(ctx.added)} files, {len(hits)} hits")
     if ctx.cfg_get("review", "check_hallucinated_imports", default=True):
-        py = [f for f in ctx.changed if f.endswith(".py")]
-        js = [f for f in ctx.changed if f.endswith((".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"))]
+        exclude = ctx.cfg_get("review", "exclude", default=[])
+        py = [f for f in ctx.changed if f.endswith(".py") and not match_any(f, exclude)]
+        js = [f for f in ctx.changed if f.endswith((".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")) and not match_any(f, exclude)]
         p1 = check_python_imports(ctx, py) if py else []
         p2 = check_js_imports(ctx, js) if js else []
         problems.extend(p1 + p2)
         evidence.append(f"import check: {len(py)} python, {len(js)} js/ts files, {len(p1) + len(p2)} unresolved")
+
     if problems:
         return _fail("G4", "review findings", problems)
     return _pass("G4", evidence)
