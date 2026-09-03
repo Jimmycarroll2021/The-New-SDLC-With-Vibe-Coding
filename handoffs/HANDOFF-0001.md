@@ -11,7 +11,7 @@ Verified: `python -m unittest discover -s tests -q` passes (24 tests, re-run aft
 
 ## Not verified
 
-Not verified: `loop.py` against a real agent CLI (claude, codex, gemini) end to end; the Azure Pipelines workflow has not been executed on a hosted runner (GitHub Actions has: the first run failed on the env leak fixed here); Windows pre-commit hook execution relies on Git for Windows' sh, which is present here but not tested on a clean machine.
+Not verified: `loop.py` against a real agent CLI (claude, codex, gemini) end to end; the Azure Pipelines file (now adapters/azure-devops/, labelled unverified) has never run on a hosted agent; GitHub Actions is verified green on push and, from this change, on a pull request; Windows pre-commit hook execution relies on Git for Windows' sh, which is present here but not tested on a clean machine.
 
 ## Review
 

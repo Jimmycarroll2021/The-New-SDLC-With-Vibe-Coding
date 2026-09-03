@@ -56,15 +56,16 @@ mkdir -p your-repo/specs your-repo/handoffs
 # 3. install the pre-commit hook (sets core.hooksPath for this clone)
 cd your-repo && python .agentic/hooks/install_hooks.py
 
-# 4. add CI: copy .github/workflows/agentic-gates.yml or azure-pipelines.yml, add your
-#    dependency install step before "Run gates"
+# 4. add CI: copy .github/workflows/agentic-gates.yml (and .github/PULL_REQUEST_TEMPLATE.md),
+#    add your dependency install step before "Run gates". Azure DevOps: see adapters/azure-devops/
 
 # 5. write the first spec and run
 cp .agentic/templates/SPEC.md specs/SPEC-0001-first-change.md
 python .agentic/gate.py
 ```
 
-Python 3.11+ and git are the only requirements.
+Python 3.11+ and git are the only requirements. GitHub Actions is the verified CI; protect `main`
+so the `gates` check is required, otherwise a direct push meets only the hook's G1 and G4.
 
 ## Daily use
 
@@ -124,7 +125,7 @@ AGENTS.md  CLAUDE.md  GEMINI.md  rules, and two one-line pointers to them
   evals/                         contract README, example_runner.py, evalset.example.jsonl
 specs/  handoffs/                one file per change, checked by G0 and G5
 docs/GATES.md                    what each gate checks and why
-adapters/                        optional per-tool conveniences
+adapters/                        optional per-tool conveniences; azure-devops/ pipeline (unverified)
 tests/test_gate.py               26 tests; each builds a real temporary git repo
 ```
 
