@@ -3,7 +3,7 @@
 Spec: SPEC-0001
 Agent: Claude Code (interactive session, human directing)
 Model: claude-opus-5
-Iterations: 1 interactive build, gates run after each file group; amended 2026-09-03 (Architecture section added to G0, G2 wording corrected to "alongside"; G0 accepts the Spec: field of a changed handoff as a reference)
+Iterations: 1 interactive build, gates run after each file group; amended 2026-09-03 (Architecture section added to G0, G2 wording corrected to "alongside"; G0 accepts the Spec: field of a changed handoff as a reference; pre-commit hook mode bit fixed to 100755 for Linux clones)
 
 ## Verified
 
