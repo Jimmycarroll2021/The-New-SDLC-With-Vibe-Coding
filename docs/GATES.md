@@ -82,18 +82,27 @@ to `agentic.toml` cannot be switched off by editing `agentic.toml`.
 
 ## G6 integrity
 
-- Fails when the change set touches `agentic.toml`, anything under `.agentic/`, or the lines of a CI
-  definition that invoke the runner, unless the branch is production tier **and** a spec **that this
-  change adds or modifies** carries a `Framework maintenance: yes` field, exactly that value. A
-  declaration merged earlier is not a standing permission. The runtime artefacts those tools write,
+- Fails when the change set touches `agentic.toml`, anything under `.agentic/`, or a CI definition
+  that already invoked the runner, unless the branch is production tier **and** the change carries a
+  valid maintenance declaration. The runtime artefacts those tools write,
   `.agentic/last-report.json`, `.agentic/runs/`, `.agentic/evals/result.json` and compiled Python,
-  are exempt.
+  are exempt — but only where they are regular files. A symlink or gitlink at one of those paths is
+  a write-through, not an artefact, and is protected.
+- A declaration is valid when all three hold: the file is a spec **this change references**, so G0
+  validated it; it satisfies G0 on its own content, so a one-line `specs/permit.md` authorises
+  nothing; and the `Framework maintenance: yes` line is **introduced or altered in this diff**, so a
+  cosmetic edit to a spec that already carried it is not a renewal. It is read from the git index at
+  commit stage and from the proposed tree in CI, and resolved before the first gate runs, so nothing
+  `tests.command` or `evals.command` executes can write itself a permission mid-run.
 - Deletions, renames away from a protected path, and file type changes all count. Moving
   `.agentic/gate.py` elsewhere is as effective as editing it, and `--diff-filter=ACMR` with rename
-  detection reports only the destination.
-- A CI definition is protected by what the change does to its gate invocation, not by the file being
-  touched at all. Bumping a Python version in the same workflow is an ordinary change; deleting the
-  step that runs the gate is not.
+  detection reports only the destination. A deletion still counts when the tree is otherwise clean
+  and the run falls back to a whole-tree audit.
+- A CI definition that ran the gate on the base ref is protected in full. See the trade-off note
+  below: a version bump in that one file is framework maintenance and has to be declared. One that
+  never ran the gate is not protected at all.
+- Fails when the base ref resolves to the candidate's own tip on any branch other than the project's
+  base branch. `--base HEAD` empties the diff, which would otherwise be a skip flag by another name.
 - Fails when the change set touches `paths.source` and the branch is not production tier. The tier
   is an assertion by whoever named the branch; this is the only thing in the repository that can
   contradict it. Renaming a branch to `docs/whatever` used to drop G0, G3 and G5 silently.
@@ -101,8 +110,7 @@ to `agentic.toml` cannot be switched off by editing `agentic.toml`.
   and the branch's tier stands, so a lowered `--tier` cannot reduce what runs.
 - Fails when no base ref resolves: with no change set, none of the above can be checked.
 - The change set it reads is the working tree **and** the committed diff against the base, so a CI
-  step that restores the policy and the runner from the base ref does not hide the edit it protects
-  against.
+  step that restores the runner from the base ref does not hide the edit it protects against.
 - Separately, `verdict()` derives the overall pass or fail from the recorded gate statuses, and
   `enforce_verdict()` re-derives it wherever a report is produced or consumed. A report that lists a
   failure cannot carry a pass verdict, and neither can one whose results do not cover the gates it
@@ -137,10 +145,20 @@ deliberately:
   test file which always passes is the S5 case, and is a code review problem, not a gate problem.
 - **Push events are not restored.** The restore is guarded on pull request events; a direct push to
   a protected branch is outside the model, which is what branch protection is for.
-- **A pull request that relaxes policy is judged by the policy it is replacing**, because CI
-  restores `agentic.toml` from the base ref. That is deliberate, and it means a policy relaxation
-  must still satisfy the old rules to land. If the old policy is unsatisfiable, the maintainer has
-  to land the policy change on its own, which is exactly the conversation that should happen.
+- **A pull request that relaxes policy is judged by its own new policy, not the one it replaces.**
+  CI restores `.agentic/` from the base ref and nothing else: `load_config()` reads the branch's
+  `agentic.toml`, deliberately, so that a policy change can be exercised by the change proposing it.
+  What stops a change granting itself a weaker policy is that the trusted G6 fails any undeclared
+  edit to `agentic.toml`, so the relaxation has to be declared in a spec and read by a human. An
+  earlier version of this document claimed CI restored the policy too and that a relaxation was
+  therefore judged by the old rules. That was never true of the workflows, whose own comments say
+  the opposite. Whether it *should* be is a design decision for the repository owner; it is open,
+  and it is recorded in `handoffs/HANDOFF-SPEC-0002.md` rather than assumed.
+- **A CI definition that runs the gate is protected in full**, not just its lines that name
+  `gate.py`. The revision the workflow trusts, the checkout depth, an enclosing `if:` and an
+  injected `PYTHONPATH` all decide what the judge is, and none of them mentions the runner. The
+  practical cost is that an action or Python version bump in that one file is framework maintenance
+  and has to be declared. A workflow that never ran the gate is not protected at all.
 - **`Framework maintenance: yes` is self-issued.** It is a declaration in a file the same change
   adds, so it stops drift, not a determined author. Its value is that the claim is in the diff, in
   a spec, where a human reviewing the pull request has to read it.

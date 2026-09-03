@@ -3,18 +3,29 @@
 Spec: SPEC-0002
 Agent: claude code, Claude Agent SDK, acting on JC's instruction
 Model: claude-opus-5
-Iterations: 3, the second and third driven by external review
+Iterations: 4, the second, third and fourth driven by external review
 
 ## Verified
 
-Verified: `python -m unittest discover -s tests -q` passes 46 tests, 26 pre-existing and 20 new in
-the `Integrity` class. `python .agentic/gate.py` on this branch reports G0 to G4 and G6 pass, G3 not
-applicable, and G5 failing only on the blank `Reviewer` field below, which is the framework's
-documented terminal state. The adversarial harness at `C:\Users\j_car\gates-stress\harness.py` was
-re-run against this branch's framework: S11, S12 and S14, the three confirmed bypasses, are now
-BLOCKED, and all 15 CATCH scenarios still fire with the same gate and the same evidence. S3 and S4,
-the tier and `--tier` bypasses, are BLOCKED by G6. The baseline stayed green on all seven gates, so
-no false positive was introduced.
+Verified: `python -m unittest discover -s tests -q` passes 57 tests, 1 skipped — 26 pre-existing,
+20 added in iteration 2 to 3, and 11 added in iteration 4 for the Codex findings. Every one of the
+11 new tests was run against the pre-fix runner (`git checkout HEAD -- .agentic/gate.py`) and all 11
+failed, so they reproduce the bypasses rather than merely describing them. The skip is
+`test_the_report_write_does_not_follow_a_symlink`: this Windows host does not permit creating a
+symlink, so that assertion has never executed. See Not verified.
+
+Verified: `python .agentic/gate.py` on this branch reports G0, G1, G2, G3, G4 and G6 pass, and G5
+failing only on the blank `Reviewer` field below, which is the framework's documented terminal
+state. G6's evidence names `specs/SPEC-0002-gate-self-bypass.md` as the declaration authorising the
+four protected files in the change.
+
+Verified: the adversarial harness at `C:\Users\j_car\gates-stress\harness.py` re-run against this
+branch, unchanged since iteration 3. The baseline is green on all seven gates, so nothing here is a
+false positive. All 15 CATCH scenarios are BLOCKED, each on the gate it targets. S3, S4, S11, S12
+and S14 remain BLOCKED by G6. The eight scenarios still ALLOWED are the documented open ones —
+concatenated and base64 secrets, a comment-only test touch, a lying eval runner, a self-filled
+`Reviewer`, a hallucinated package declared in `requirements.txt`, a hollow spec, and an empty
+directory shadowing a package name — unchanged in number and identity from iteration 3.
 
 Two changes were made to the harness itself, outside this repository. Both make the rig stricter
 rather than weaker, and both are bugs of the same class as the two the original stress test found.
@@ -67,8 +78,10 @@ Findings deliberately **not** acted on, with the reason:
   local run and the CI run stop agreeing, and the branch-rename bypass stays open locally.
 - **"`Framework maintenance: yes` is self-issued" (both reviewers).** Correct, and already stated in
   the spec. It stops drift, not a determined author. Its value is that the claim sits in the diff.
-- **"A pull request that relaxes policy is judged by the policy it replaces" (Gemini, P0).**
-  Deliberate. That is the whole point of restoring from the base ref. Documented as a trade-off.
+- **"A pull request that relaxes policy is judged by the policy it replaces" (Gemini, P0).** This
+  answer was wrong, and Codex caught it in iteration 4: CI restores `.agentic/` only, so a
+  relaxation is judged by its own new policy. What actually stops it is the trusted G6 failing an
+  undeclared `agentic.toml` edit. Whether CI should also restore the policy is open, below.
 - **"fetch-depth may be 1, so the base ref is missing" (Kimi, P0).** Not a defect: the workflow has
   carried `fetch-depth: 0` since before this change. Kimi could not see it in a diff of changed
   lines only.
@@ -80,13 +93,72 @@ Findings deliberately **not** acted on, with the reason:
 - Push events, fork pull requests and direct pushes to a protected branch: outside the model.
   Branch protection is what covers those, and the docs now say so.
 
+## Iteration 4: Codex, and a correction to this document
+
+Codex reviewed the full diff independently and found six further defects — three P0, two P1 and one
+P2 — explicitly excluding the two P0s Gemini and Kimi had already found. All six are fixed.
+
+The three P0s were one bug wearing three faces: **G6 decided whether a candidate was authorised by
+reading mutable state the candidate controlled.** The remedy is the principle, not three patches.
+`resolve_integrity()` now computes the change set, the protected paths and the authorising
+declaration once, in `run()`, before the first gate is called, and `candidate_text()` takes content
+from the git index at commit stage and from the proposed tree in CI.
+
+1. **The CI fingerprint was a substring match.** `gate_invocation_lines()` kept only lines
+   containing `gate.py`, so the code choosing `BASE_SHA` was invisible to it. Swapping
+   `${{ github.event.pull_request.base.sha }}` for `$(git rev-parse HEAD)` made CI archive
+   `.agentic` from the pull request's own head, call it trusted, and run the candidate's runner,
+   with every `gate.py` line byte-identical. A gate-bearing CI definition is now protected in full.
+2. **Authorisation was read off the working tree after G2 and G3 had run branch code.** A discovered
+   test could append `Framework maintenance: yes` to a spec mid-run; the pre-commit variant needed
+   no test at all, only an unstaged edit. Both are closed by the snapshot and the ordering.
+3. **An old declaration was standing permission.** G6 checked that a spec path had changed and that
+   the whole current file contained the field. A typo fix in a year-old maintenance spec authorised
+   today's runner edit, and a one-line unreferenced `specs/permit.md` worked too. A declaration is
+   now valid only when the file is a referenced spec, satisfies G0 on its own content, and carries
+   the declaration line in this change's diff.
+
+P1s: whole-tree mode set `change_set = []`, discarding deletions `vanished_files()` had already
+caught, and `--base HEAD` selected that mode deliberately, which is a local skip flag. Whole-tree
+mode now keeps `vanished`, and a base that resolves to the candidate's own tip is refused on any
+branch but the project's base branch. And `is_protected()` exempted `PROTECTED_RUNTIME` paths with
+no file-type check, so `.agentic/last-report.json -> ../agentic.toml` let the report write overwrite
+the policy. The exemption is now regular files only, and the report is written create-and-replace.
+
+**The P2 is a correction to this document and to `docs/GATES.md`, and it is the one that matters
+most.** Both claimed CI restores `agentic.toml` from the base ref so that a policy relaxation is
+judged by the policy it replaces. **It does not.** Only `.agentic/` is restored; the workflows' own
+comments say so, and `load_config()` reads the branch's policy. Worse, the "Not verified" section
+below claimed the restore of both had been manually exercised. That was a false verification claim
+in a document signed off bar the `Reviewer` field, and a false verification claim is worse than the
+gap it hides. The documentation now describes what the workflows actually do.
+
+**Open, and JC's call: should CI also restore `agentic.toml` from the base ref?** Doing so would
+judge a policy relaxation by the policy it replaces, at the cost that a policy change could no
+longer be exercised by the change proposing it. The CI restore semantics were deliberately left
+unchanged here. It is recorded in the spec's Out of scope rather than decided.
+
 ## Not verified
 
-Not verified: the two CI workflow changes have never executed on a runner. The GitHub Actions and
-Azure Pipelines steps that restore `.agentic/` and `agentic.toml` from the base ref were read by eye
-and the equivalent `git checkout origin/main -- .agentic agentic.toml` was exercised by hand in a
-test fixture, but this branch is not pushed, so no pull request has run them. A human must confirm
-the first real run restores, prints what it restored, and still fails G6 on the committed edit.
+Not verified: the two CI workflow changes have never executed on a runner. The steps that unpack the
+base ref's `.agentic/` outside the working tree were read by eye and the equivalent
+`git checkout origin/main -- .agentic` was exercised by hand in a test fixture, but this branch is
+not pushed, so no pull request has run them. A human must confirm the first real run unpacks, prints
+what it is judging with, and still fails G6 on the committed edit. Nothing in this repository
+restores `agentic.toml` from the base ref, and no claim here should be read as saying it does.
+
+Not verified: that the report write refuses to follow a symlink. The code path exists
+(`out_dir.is_symlink() or report.is_symlink()` then create-and-replace via `os.replace`) and the
+test exists, but this Windows host does not permit creating symlinks, so the test **skips** and has
+never run. The protection half — G6 treating a symlinked runtime artefact as protected — is fully
+tested, because that fixture builds the symlink through the git index rather than the filesystem. A
+Linux CI run is what confirms the write half.
+
+Not verified end to end: Codex's own reproductions. Three of the six mechanisms were spot-checked
+against the source before the fixes were written — the bare `"gate.py" in line` substring test, the
+`change_set = []` under whole-tree mode, and the missing file-type check in `is_protected()`. The
+complete exploit chains Codex ran in disposable repositories were not re-executed here; what was
+built instead is a failing regression test per defect, each confirmed to fail on the pre-fix runner.
 
 Not verified: that the local tripwire holds against an author who removes G6 from the runner in the
 same change. It does not, and it cannot. Nothing that runs from inside a branch can defend itself
