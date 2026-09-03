@@ -12,6 +12,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".agentic"))
@@ -195,6 +196,18 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(rep["tier"], "prototype")
         self.assertEqual([r["gate"] for r in rep["results"]], ["G4"])
         self.assertTrue(rep["ok"])
+
+    def test_ci_env_vars_ignored_for_a_repo_that_is_not_the_ci_workspace(self):
+        # regression: the first GitHub Actions run leaked GITHUB_REF_NAME=main into the fixtures
+        self.fx.branch("proto/idea")
+        self.fx.write("src/x.py", "import os\n")
+        with mock.patch.dict(os.environ, {"GITHUB_WORKSPACE": "/home/runner/work/other", "GITHUB_REF_NAME": "main",
+                                          "GITHUB_BASE_REF": "main"}):
+            rep = self.fx.run()
+            self.assertEqual(rep["tier"], "prototype")
+            self.assertEqual(rep["branch"], "proto/idea")
+        with mock.patch.dict(os.environ, {"GITHUB_WORKSPACE": str(self.fx.root), "GITHUB_REF_NAME": "release/1"}):
+            self.assertEqual(self.fx.run()["branch"], "release/1")   # honoured when the root IS the workspace
 
     def test_commit_stage_restricts_to_cheap_gates(self):
         full_production_setup(self.fx)
