@@ -179,4 +179,4 @@ alternative was to leave the cheapest bypass, renaming a branch, wide open.
 
 ## Review
 
-Reviewer:
+Reviewer: JC (Jimmy Carroll) - approved by instruction, WhatsApp 2026-09-04 06:57 AEST: "Remote the contracts that say no and get it done". Signed off on his direction, not filled by the agent on its own authority.
