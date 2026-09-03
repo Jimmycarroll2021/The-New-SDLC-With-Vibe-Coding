@@ -125,9 +125,10 @@ Enforcement, honestly split:
 Unpacking the trusted runner outside the tree rather than restoring it into the tree is what makes
 framework maintenance possible at all: the branch's own tests still import the branch's runner, so a
 change to the runner can be tested by the change that makes it, while the verdict still comes from
-the reviewed copy. The policy read is deliberately the branch's `agentic.toml`, so a policy change
-can be exercised by the change proposing it; the trusted G6 is what stops a change granting itself a
-weaker policy undeclared.
+the reviewed copy. The policy read follows the rule in "In CI the policy comes from the base ref"
+below: the base ref's `agentic.toml` at `--stage ci`, the branch's own locally and in the hook, and
+the branch's own in CI too when the change declares framework maintenance, so that a policy change
+can still be exercised by the change proposing it.
 
 The tripwire is defeated by an author who edits G6 out of the runner in the same change. Nothing
 that runs from inside a branch can defend itself against edits to itself; that is why the CI
@@ -216,6 +217,25 @@ matters.
 28. Emptying `paths.source` in the candidate's own `agentic.toml` does not defeat the tier floor.
     It cannot be emptied without editing the policy, and a protected path on a non-production
     branch fails G6 before any declaration is considered.
+29. Framework maintenance is authorised by the **branch's** tier, not the effective one. Neither
+    the source floor nor a raised `--tier` turns a prototype or internal branch into a place the
+    policy or the runner can be edited from.
+30. Being handed the candidate's policy in CI requires the base policy's own G6 to pass, not merely
+    to find a declaration. A change that rewrites `[tiers.branch_patterns]` so its own branch reads
+    as production is still judged by the base policy.
+31. At `--stage ci` a declaration must be in the proposed tree. Neither an untracked spec nor an
+    uncommitted edit to a tracked one authorises anything, and a path absent from `HEAD` reads as
+    absent rather than falling through to the working tree.
+32. `project.base_branch` does not decide the base in CI. The fallback is the conventional name, so
+    pointing the key at the branch's own tip cannot empty the diff.
+33. The environment decision behind the import existence check is part of the snapshot, resolved
+    before any gate runs. A test command that creates a virtualenv marker during G2 does not turn
+    G4's existence failures into `not_applicable`.
+34. The whole dotted import path is resolved, not only its first component, by walking the package
+    on disk rather than importing it. `import installed_pkg.does_not_exist` fails. Where the package
+    is not observable on disk the walk says nothing rather than guessing. A `node_modules` entry is
+    resolved through `exports`, `main` and Node's index rules, and `node_modules` is looked up from
+    the importing file upwards, so a workspace layout resolves the way Node resolves it.
 
 ## Out of scope
 
@@ -255,6 +275,15 @@ matters.
   is being reviewed by three models and a human rather than by itself.
 - **Merge queues.** There is no `merge_group` trigger, so a repository using a merge queue needs one
   added, and needs the trusted-runner step taught about that event.
+- **`is_protected()` case-folds unconditionally.** On a case-sensitive filesystem an unrelated
+  `Agentic.toml` is treated as the policy. That is a false positive, it fails safe, and the
+  alternative reopens the case-insensitive bypass it was added for. Left as it is, deliberately.
+- **A CI definition counts as gate-bearing on a substring.** A workflow whose base content merely
+  mentions `gate.py`, in a comment or an echoed string, is protected in full. Over-protection, not
+  under-protection; parsing YAML to tell an invocation from a mention is a different change.
+- **`dir_has_importable()` has a node budget and a depth limit.** A package whose first real module
+  is deeper than six levels, or behind more than four hundred directories, reads as empty. No
+  distribution in ordinary use is laid out that way, and an unbounded walk in a gate is worse.
 - **Path quoting beyond non-ASCII.** Every git call now runs with `core.quotePath=false`, which
   covers the realistic case of an accented or CJK filename. Git still C-quotes a path containing a
   literal double quote, a backslash or a control character, and the line-oriented readers
@@ -277,11 +306,12 @@ framework is installed. A regression here is not visible in the report it produc
 
 ## Verification
 
-- Criteria 1 to 7, 12 to 18 and 20 to 28: `tests/test_gate.py`, classes `Integrity` and `EndToEnd`,
+- Criteria 1 to 7, 12 to 18 and 20 to 34: `tests/test_gate.py`, classes `Integrity` and `EndToEnd`,
   each building a real temporary git repository and asserting the failure mode and the matching
-  pass. 71 tests, one skipped (see criterion 19). Each test added for criteria 20 to 25 was run
+  pass. 82 tests, two skipped (see criterion 19). Each test added for criteria 20 to 25 was run
   against the previous runner first: five failed on the assertion and three errored on the absent
-  `policy` key, which is itself the proof that the behaviour did not exist.
+  `policy` key, which is itself the proof that the behaviour did not exist. All ten added for
+  criteria 29 to 34 failed against the runner immediately before their fix.
 - Criterion 19: the protection half is tested (`test_g6_treats_a_symlinked_runtime_artefact_as_
   protected`, which builds the symlink through the git index so it runs on Windows). The write half
   is tested by `test_the_report_write_does_not_follow_a_symlink`, which **skips** on a host that

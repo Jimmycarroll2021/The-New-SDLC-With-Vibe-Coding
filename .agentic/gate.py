@@ -20,6 +20,8 @@ from __future__ import annotations
 import argparse
 import ast
 import fnmatch
+import importlib.machinery
+import importlib.metadata
 import importlib.util
 import json
 import os
@@ -246,6 +248,15 @@ class Repo:
     def show(self, ref: str, path: str) -> str:
         return self.git("show", f"{ref}:{path}")
 
+    def show_blob(self, ref: str, path: str) -> str | None:
+        """The blob, or None when the path does not exist at that revision. `show` cannot tell an
+        empty file from a missing one, and at CI stage that difference decides whether a candidate
+        may fall back to the working tree."""
+        p = subprocess.run(["git", "-c", "core.quotePath=false", "cat-file", "-e", f"{ref}:{path}"],
+                           cwd=self.root, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace")
+        return self.git("show", f"{ref}:{path}") if p.returncode == 0 else None
+
     def is_tracked(self, rel: str) -> bool:
         return bool(self.git("ls-files", "--error-unmatch", rel).strip())
 
@@ -307,6 +318,7 @@ class Ctx:
     branch: str
     changed: list[str]
     changed_mode: str
+    branch_tier: str = "production"
     committed: list[str] = field(default_factory=list)
     vanished: list[str] = field(default_factory=list)
     merge_base: str | None = None
@@ -357,8 +369,9 @@ def resolve_tier(cfg: dict, branch: str, requested: str | None) -> tuple[str, st
         raise SystemExit(f"unknown tier '{requested}'. Known: {list(TIER_RANK)}")
     if TIER_RANK[requested] < TIER_RANK[tier]:
         return tier, (f"--tier {requested} is below the tier '{tier}' that branch '{branch}' implies. "
-                      f"The tier decides which gates apply, so lowering it is a skip flag. The run stays "
-                      f"'{tier}': move the work to a {requested} branch instead.")
+                      f"The tier decides which gates apply, so lowering it is a skip flag. The value is "
+                      f"ignored and the branch's tier stands: move the work to a {requested} branch "
+                      "instead.")
     return requested, None
 
 
@@ -579,7 +592,14 @@ def declared_python_deps(root: Path, aliases: dict[str, str]) -> tuple[set[str],
         return re.sub(r"[-_.]+", "_", s.strip().lower())
 
     def req_name(line: str) -> str | None:
-        line = line.split("#", 1)[0].strip()
+        raw = line.strip()
+        egg = re.search(r"#egg=([A-Za-z0-9._-]+)", raw)     # a VCS or URL requirement names itself
+        if egg:
+            return norm(egg.group(1))
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith(("-e ", "--editable ")):          # an editable install is a declaration
+            line = line.split(" ", 1)[1].strip()
+            return norm(Path(line).name) if line and not line.startswith("-") else None
         if not line or line.startswith(("-", "git+", "http")):
             return None
         return norm(re.split(r"[\s\[<>=!~;@]", line, 1)[0])
@@ -617,20 +637,33 @@ def local_python_modules(root: Path) -> set[str]:
     mods = set()
     skip = SKIP_DIRS
     for p in root.rglob("*"):
-        if any(part in skip for part in p.parts):
+        try:    # relative: an ancestor of the repository named "build" must not blank the scan
+            rel_parts = p.relative_to(root).parts
+        except ValueError:
+            continue
+        if any(part in skip for part in rel_parts):
             continue
         if p.suffix == ".py":
             mods.add(p.stem)
-            mods.add(p.parent.name)
+            # only a real package contributes its directory name. Without this, any directory
+            # anywhere holding one .py file makes an import of that directory's name look local,
+            # which is the empty-directory bypass with a file dropped in it.
+            if (p.parent / "__init__.py").is_file():
+                mods.add(p.parent.name)
         elif p.is_dir() and (p / "__init__.py").exists():
             mods.add(p.name)
     for p in root.iterdir():
         if p.is_dir() and not p.name.startswith(".") and dir_has_importable(p):
             mods.add(p.name)
+        elif p.is_file():   # a compiled extension at the root imports by its pre-ABI name
+            for s in importlib.machinery.EXTENSION_SUFFIXES:
+                if p.name.endswith(s):
+                    mods.add(p.name[: -len(s)])
+                    break
     return mods
 
 
-def dir_has_importable(d: Path, depth: int = 3) -> bool:
+def dir_has_importable(d: Path, depth: int = 6, budget: list[int] | None = None) -> bool:
     """A directory is an importable package only if it actually holds a module, at some depth.
 
     An empty directory named after a package is the stress test's bypass: it makes a hallucinated
@@ -641,20 +674,29 @@ def dir_has_importable(d: Path, depth: int = 3) -> bool:
     try:
         if (d / "__init__.py").is_file():
             return True
+        if budget is None:
+            budget = [400]
         subdirs = []
         for c in d.iterdir():
-            if c.is_file() and c.suffix in (".py", ".pyd", ".so"):
+            if c.is_file() and (c.suffix in (".py", ".pyd", ".so")
+                                or any(c.name.endswith(s) for s in importlib.machinery.EXTENSION_SUFFIXES)):
                 return True
-            if c.is_dir() and c.name not in SKIP_DIRS:
+            # only __pycache__ is pruned inside a package: `build`, `dist` and `env` are perfectly
+            # ordinary submodule names, and pruning them by name rejects real packages
+            if c.is_dir() and c.name not in ("__pycache__", ".git"):
                 subdirs.append(c)
-        if depth > 0:
-            return any(dir_has_importable(c, depth - 1) for c in subdirs)
+        for c in subdirs:
+            if depth <= 0 or budget[0] <= 0:
+                break
+            budget[0] -= 1
+            if dir_has_importable(c, depth - 1, budget):
+                return True
     except OSError:
         return False
     return False
 
 
-def python_env_note(ctx: Ctx) -> tuple[str | None, str | None]:
+def python_env_note(ctx: Ctx, change_set: list[str]) -> tuple[str | None, str | None]:
     """(why the existence check cannot run, why a virtualenv marker was not honoured).
 
     Offline by construction: the gate never asks a package index, so "exists" means "resolves in the
@@ -667,23 +709,23 @@ def python_env_note(ctx: Ctx) -> tuple[str | None, str | None]:
     flag for half of G4, written in the diff being judged. `mkdir .venv && touch .venv/pyvenv.cfg`
     is the obvious attempt and it does not work."""
     root = ctx.repo.root
-    changed = {f.replace("\\", "/") for f in set(ctx.changed) | set(ctx.integrity.change_set)}
+    changed = {f.replace("\\", "/") for f in set(ctx.changed) | set(change_set)}
     try:    # any directory carrying pyvenv.cfg, not only .venv/venv/env
         envs = sorted(d for d in root.iterdir() if d.is_dir() and (d / "pyvenv.cfg").is_file())
     except OSError:
         envs = []
-    for d in envs:
-        name = d.name
-        try:    # samefile, not resolve(): a symlinked root or a case-folded Windows path is the
-                # same environment, and getting that wrong skips the check while running inside it
+    for d in envs:      # every candidate first: an active environment beats a foreign one that
+        try:            # happens to sort earlier, or the check is skipped while running inside it
             if Path(sys.prefix).samefile(d):
-                return None, None          # the gate is running in it: check normally
+                return None, None
         except OSError:
             try:
                 if Path(sys.prefix).resolve() == d.resolve():
                     return None, None
             except OSError:
                 pass
+    for d in envs:
+        name = d.name
         if any(p == name or p.startswith(name + "/") for p in changed):
             return None, (f"./{name} is part of this change, so it does not disable the existence "
                           "check: an environment a change brings with it is a skip flag")
@@ -696,34 +738,65 @@ def python_env_note(ctx: Ctx) -> tuple[str | None, str | None]:
     return None, None
 
 
-def python_module_exists(top: str) -> str | None:
+def python_module_exists(top: str, dotted: str = "") -> str | None:
     """None when the import resolves to real code, otherwise why it does not.
 
-    find_spec asks the interpreter's own finders. It does not execute the module and it does not
-    touch the network, so the gate stays deterministic and offline."""
+    find_spec asks the interpreter's own finders for the top-level name. It does not execute the
+    module and it does not touch the network. The remaining dotted parts are then walked on the
+    filesystem rather than imported, because importing `a.b` runs `a/__init__.py`, and a gate may
+    not run the code it is judging. Where the walk cannot see the package on disk it says nothing:
+    a false pass is better than failing a real import the gate simply cannot observe."""
     try:
         spec = importlib.util.find_spec(top)
-    except (ImportError, AttributeError, ValueError, TypeError, OSError):
-        # OSError covers an unreadable sys.path entry: a finder raising is not a verdict about the
-        # package, but a gate that crashes is worse than one that reports what it saw.
+    except Exception:
+        # any finder on sys.meta_path may raise anything at all: a gate that crashes is worse than
+        # one that reports what it saw
         return "is declared but does not resolve in this environment"
     if spec is None:
         return "is declared but is not installed in this environment"
-    if spec.origin in (None, "namespace"):
-        locs = [Path(p) for p in (spec.submodule_search_locations or [])]
-        if not any(dir_has_importable(p) for p in locs):
-            return ("is declared but resolves only to a directory holding no importable module: "
-                    f"{[str(p) for p in locs[:2]]}")
+    locs = [Path(p) for p in (spec.submodule_search_locations or [])]
+    if spec.origin in (None, "namespace") and not any(dir_has_importable(p) for p in locs):
+        return ("is declared but resolves only to a directory holding no importable module: "
+                f"{[str(p) for p in locs[:2]]}")
+    parts = dotted.split(".")[1:] if dotted else []
+    for i, part in enumerate(parts):
+        here = [d for d in locs if d.is_dir()]
+        if not here:
+            return None                     # not observable on disk: do not guess
+        nxt, found = [], False
+        for d in here:
+            if (d / part).is_dir():
+                nxt.append(d / part)
+                found = True
+            elif (d / f"{part}.py").is_file() or any((d / (part + s)).is_file()
+                                                     for s in importlib.machinery.EXTENSION_SUFFIXES):
+                found = True
+        if not found:
+            return f"is declared, but '{'.'.join([top] + parts[:i + 1])}' does not exist in it"
+        locs = nxt
     return None
+
+
+def installed_import_names() -> dict[str, list[str]]:
+    """Top-level import name -> distributions that provide it, from installed metadata only."""
+    try:
+        return importlib.metadata.packages_distributions()
+    except Exception:
+        return {}
 
 
 def check_python_imports(ctx: Ctx, files: list[str]) -> tuple[list[str], list[str]]:
     aliases = dict(DEFAULT_IMPORT_ALIASES)
     aliases.update(ctx.cfg_get("review", "import_aliases", default={}))
     declared, manifests = declared_python_deps(ctx.repo.root, aliases)
+    # an import name is also declared when an installed distribution owns it: google-cloud-storage
+    # in requirements.txt provides the `google` namespace, and no alias table can list them all
+    for top, dists in installed_import_names().items():
+        if any(re.sub(r"[-_.]+", "_", d.lower()) in declared for d in dists):
+            declared.add(re.sub(r"[-_.]+", "_", top.lower()))
     local = local_python_modules(ctx.repo.root)
     stdlib = set(sys.stdlib_module_names) | {"__future__"}
-    env_note, refused = python_env_note(ctx)
+    env_note, refused = ctx.integrity.python_env
     notes = [f"import existence: not_applicable - {env_note}"] if env_note else []
     if refused:
         notes.append(f"import existence: applied - {refused}")
@@ -758,26 +831,64 @@ def check_python_imports(ctx: Ctx, files: list[str]) -> tuple[list[str], list[st
                     continue
                 # Declared is not the same as real. A name in requirements.txt that resolves to
                 # nothing, or to an empty directory, is still a hallucinated dependency.
-                why = None if env_note else python_module_exists(top)
+                why = None if env_note else python_module_exists(top, name)
                 if why:
                     problems.append(f"{f}:{ln}: import '{top}' {why}")
     return problems, notes
 
 
-def js_module_exists(modules_dir: Path, name: str) -> str | None:
-    """None when the package is really installed under node_modules, otherwise why it is not.
-    Filesystem only: no registry lookup and no `npm ls`."""
+def js_entry_ok(modules_dir: Path, name: str) -> bool:
+    """Whether node_modules/<name> holds something Node could actually load. Filesystem only: no
+    registry lookup and no `npm ls`."""
     d = modules_dir
     for part in name.split("/"):
         d = d / part
     if not d.is_dir():
-        return "is declared in package.json but is not installed in node_modules"
-    if (d / "package.json").is_file():
-        return None
+        return False
+    pj = d / "package.json"
+    if pj.is_file():
+        try:
+            data = json.loads(pj.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            data = {}
+        if data.get("exports") is not None:
+            return True
+        main = data.get("main")
+        if isinstance(main, str) and main:
+            t = d / main
+            if t.is_file() or (t / "index.js").is_file() or any(
+                    (d / (main + s)).is_file() for s in (".js", ".json", ".node", ".mjs", ".cjs")):
+                return True
+        for idx in ("index.js", "index.mjs", "index.cjs", "index.json", "index.node"):
+            if (d / idx).is_file():
+                return True
+        return False
     for pat in ("*.js", "*.mjs", "*.cjs", "*.json", "*.node", "*.ts"):
         if any(d.glob(pat)):
-            return None
-    return "is declared but its node_modules directory holds no importable module"
+            return True
+    return False
+
+
+def node_modules_dirs(root: Path, rel_file: str) -> list[Path]:
+    """Every node_modules from the importing file's directory up to the repository root, which is
+    how Node resolves and how a workspace or monorepo is laid out."""
+    out, d = [], (root / rel_file).parent
+    while True:
+        if (d / "node_modules").is_dir():
+            out.append(d / "node_modules")
+        if d == root or root not in d.parents:
+            break
+        d = d.parent
+    return out
+
+
+def js_module_exists(root: Path, rel_file: str, name: str) -> str | None:
+    dirs = node_modules_dirs(root, rel_file)
+    if any(js_entry_ok(nm, name) for nm in dirs):
+        return None
+    if any((nm / Path(*name.split("/"))).is_dir() for nm in dirs):
+        return "is declared but its node_modules entry has nothing Node could load"
+    return "is declared in package.json but is not installed in node_modules"
 
 
 def check_js_imports(ctx: Ctx, files: list[str]) -> tuple[list[str], list[str]]:
@@ -790,8 +901,8 @@ def check_js_imports(ctx: Ctx, files: list[str]) -> tuple[list[str], list[str]]:
                 declared |= set((data.get(k) or {}).keys())
         except json.JSONDecodeError:
             pass
-    modules_dir = ctx.repo.root / "node_modules"
-    env_note = None if modules_dir.is_dir() else (
+    has_modules = any(node_modules_dirs(ctx.repo.root, f) for f in files)
+    env_note = None if has_modules else (
         "node_modules is not present, so the gate cannot tell an installed package from a "
         "hallucinated one. Install the project's packages before the gate runs.")
     ignore_prefixes = tuple(ctx.cfg_get("review", "js_alias_prefixes", default=["@/", "~/", "#"]))
@@ -814,7 +925,7 @@ def check_js_imports(ctx: Ctx, files: list[str]) -> tuple[list[str], list[str]]:
                 where = "package.json" if pkg.is_file() else "no package.json found"
                 problems.append(f"{f}:{ln}: import '{name}' not declared in {where}")
                 continue
-            why = None if env_note else js_module_exists(modules_dir, name)
+            why = None if env_note else js_module_exists(ctx.repo.root, f, name)
             if why:
                 problems.append(f"{f}:{ln}: import '{name}' {why}")
     return problems, ([f"import existence: not_applicable - {env_note}"] if env_note else [])
@@ -884,9 +995,9 @@ def candidate_text(ctx: Ctx, rel: str) -> str:
     if ctx.stage == "commit":
         return ctx.repo.git("show", f":{rel}")
     if ctx.stage == "ci":
-        blob = ctx.repo.git("show", f"HEAD:{rel}")
-        if blob:
-            return blob
+        # no fall-through to the working tree: in CI the proposed tree is the candidate, and an
+        # uncommitted file is not part of what is being proposed
+        return ctx.repo.show_blob("HEAD", rel) or ""
     return read_text(ctx.repo.root / rel) or ""
 
 
@@ -938,7 +1049,8 @@ def declaration_diff_paths(ctx: Ctx) -> set[str]:
     if ctx.stage == "commit":
         diffs.append(ctx.repo.git("diff", "--cached", "-U0", "--diff-filter=ACMR"))
     elif ctx.merge_base:
-        diffs.append(ctx.repo.git("diff", "-U0", "--diff-filter=ACMR", ctx.merge_base))
+        if ctx.stage != "ci":   # in CI only the committed diff counts, for the same reason
+            diffs.append(ctx.repo.git("diff", "-U0", "--diff-filter=ACMR", ctx.merge_base))
         diffs.append(ctx.repo.git("diff", "-U0", "--diff-filter=ACMR", f"{ctx.merge_base}..HEAD"))
     out, cur = set(), None
     for raw in (line for d in diffs for line in d.splitlines()):
@@ -963,7 +1075,9 @@ def resolve_declaration(ctx: Ctx) -> tuple[str | None, list[str]]:
     in_diff = declaration_diff_paths(ctx)
     untracked = {f.strip().replace("\\", "/")
                  for f in ctx.repo.git("ls-files", "--others", "--exclude-standard").splitlines()
-                 if f.strip()}
+                 if f.strip()} if ctx.stage == "local" else set()
+    # an untracked spec is a real declaration only in a local run, where the working tree IS the
+    # candidate. At commit stage the index is the candidate and at CI stage the proposed tree is
     notes: list[str] = []
     changed = {f.replace("\\", "/") for f in list(ctx.changed) + list(ctx.committed)}
     for rel in sorted(changed):
@@ -996,7 +1110,9 @@ def base_is_the_project_base(ctx: Ctx) -> bool:
     project's own base branch. Anywhere else a base equal to the candidate's tip was chosen by the
     candidate, and an empty diff is a skip flag by another name."""
     configured = str(ctx.cfg_get("project", "base_branch", default="main"))
-    names = {configured, configured.removeprefix("origin/"), f"origin/{configured}"}
+    names = {"main", "master", "origin/main", "origin/master"}
+    if ctx.stage != "ci":       # locally the configured value is the author's own; in CI it is the
+        names |= {configured, configured.removeprefix("origin/"), f"origin/{configured}"}
     return ctx.branch in names and (ctx.base or "") in names
 
 
@@ -1015,6 +1131,7 @@ class Integrity:
     source: list[str] = field(default_factory=list)
     declared: str | None = None
     tier_floor: str | None = None
+    python_env: tuple[str | None, str | None] = (None, None)
     problems: list[str] = field(default_factory=list)
     evidence: list[str] = field(default_factory=list)
 
@@ -1057,6 +1174,10 @@ def resolve_integrity(ctx: Ctx) -> Integrity:
     if out.protected:
         out.declared, notes = resolve_declaration(ctx)
         out.evidence.extend(notes)
+    # resolved here, with everything else, because G2 runs the branch's own test command: a test
+    # that creates a virtualenv marker mid-run would otherwise turn every G4 existence failure into
+    # not_applicable, which is the snapshot bug in a different gate
+    out.python_env = python_env_note(ctx, out.change_set)
     return out
 
 
@@ -1071,9 +1192,11 @@ def gate_g6_integrity(ctx: Ctx) -> GateResult:
     if ctx.tier_override_problem:
         problems.append(ctx.tier_override_problem)
     if intg.protected:
-        if ctx.tier != "production":
+        # the BRANCH's tier, not the effective one: neither the source floor nor a raised --tier may
+        # turn a spike branch into a place where the runner can be edited
+        if ctx.branch_tier != "production":
             problems.append(f"{intg.protected[:6]}: the policy and the runner may not be changed from a "
-                            f"'{ctx.tier}' branch. Framework maintenance is production work.")
+                            f"'{ctx.branch_tier}' branch. Framework maintenance is production work.")
         elif intg.declared is None:
             problems.append(f"{intg.protected[:6]}: this change edits the policy, the runner or the CI "
                             "definition that judges it. If it is deliberate framework maintenance, say so "
@@ -1105,7 +1228,10 @@ def load_config(root: Path) -> dict:
     p = root / "agentic.toml"
     if not p.is_file():
         raise SystemExit(f"agentic.toml not found in {root}. Copy it from the framework and edit [paths].")
-    return tomllib.loads(p.read_text(encoding="utf-8"))
+    try:
+        return tomllib.loads(p.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as e:
+        raise SystemExit(f"agentic.toml does not parse: {e}") from None
 
 
 def verdict(results) -> bool:
@@ -1151,10 +1277,13 @@ def resolve_base(repo: Repo, cfg: dict, stage: str, base: str | None) -> str | N
     if base is not None or stage == "commit":
         return base
     env = os.environ if repo.ci_env_applies() else {}
+    # In CI the fallback is the conventional name, never project.base_branch: that key is in the
+    # file the change may be editing, so pointing it at the branch's own tip would empty the diff.
+    fallback = "main" if stage == "ci" else cfg.get("project", {}).get("base_branch", "main")
     base = (env.get("GITHUB_BASE_REF") and f"origin/{env['GITHUB_BASE_REF']}") \
         or (env.get("SYSTEM_PULLREQUEST_TARGETBRANCH") and
             "origin/" + env["SYSTEM_PULLREQUEST_TARGETBRANCH"].removeprefix("refs/heads/")) \
-        or cfg.get("project", {}).get("base_branch", "main")
+        or fallback
     if base and not repo.git("rev-parse", "--verify", "--quiet", base).strip():
         for alt in (f"origin/{base}", base.removeprefix("origin/")):
             if repo.git("rev-parse", "--verify", "--quiet", alt).strip():
@@ -1168,6 +1297,7 @@ def build_ctx(repo: Repo, cfg: dict, stage: str, base: str | None, tier_override
     tier, tier_problem = resolve_tier(cfg, branch, tier_override)
     changed, mode = repo.changed_files(base, stage == "commit")
     return Ctx(repo, cfg, stage, base, tier, branch, changed, mode,
+               branch_tier=detect_tier(cfg, branch),
                committed=repo.committed_changed_files(base), tier_override_problem=tier_problem,
                vanished=repo.vanished_files(base, stage == "commit"),
                merge_base=repo.merge_base(base))
@@ -1208,7 +1338,10 @@ def resolve_policy(repo: Repo, cfg: dict, stage: str, base: str | None,
     if cfg_base is None:
         return ctx, f"candidate: {why}"
     trial = build_ctx(repo, cfg_base, stage, base, tier_override)
-    if trial.integrity.declared:
+    # the whole of G6 under the base policy, not the declaration alone: a candidate that rewrites
+    # [tiers.branch_patterns] so its own branch reads as production would otherwise hand itself the
+    # policy its declaration was rejected under
+    if trial.integrity.declared and gate_g6_integrity(trial).status == "pass":
         return ctx, f"candidate: framework maintenance declared in {trial.integrity.declared}"
     return trial, why
 
@@ -1277,8 +1410,17 @@ def main(argv: list[str] | None = None) -> int:
         if out_dir.is_symlink() or report.is_symlink():
             raise OSError(f"{report} or its directory is a symlink: refusing to write the report")
         out_dir.mkdir(exist_ok=True)
-        tmp = out_dir / ".last-report.json.tmp"
-        tmp.write_text(json.dumps(rep, indent=2), encoding="utf-8")
+        # the temporary file is as much of a write-through as the report itself: a symlink left at a
+        # predictable .tmp path would be followed before os.replace ever runs
+        tmp = out_dir / f".last-report.{os.getpid()}.tmp"
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(tmp, flags, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(rep, indent=2))
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         os.replace(tmp, report)
     except OSError:
         pass

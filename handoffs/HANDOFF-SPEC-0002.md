@@ -3,11 +3,11 @@
 Spec: SPEC-0002
 Agent: claude code, Claude Agent SDK, acting on JC's instruction
 Model: claude-opus-5
-Iterations: 5, the second to fifth driven by external review and by JC's decisions on the open items
+Iterations: 6, the second to sixth driven by external review and by JC's decisions on the open items
 
 ## Verified
 
-Verified: `python -m unittest discover -s tests -q` passes 71 tests, 1 skipped — 26 pre-existing,
+Verified: `python -m unittest discover -s tests -q` passes 82 tests, 2 skipped — 26 pre-existing,
 20 added in iteration 2 to 3, 11 added in iteration 4 for the Codex findings, and 14 added in
 iteration 5 for the three decisions and the round-four and round-five findings. Every test added in
 iteration 4 was run against the pre-fix runner and failed. Of the eight added first in iteration 5,
@@ -15,14 +15,17 @@ five failed on an assertion and three errored on the absent `policy` key. Of the
 the round-five review, three failed against the pre-fix runner; the fourth,
 `test_the_tier_floor_cannot_be_emptied_by_the_candidates_own_paths_source`, passed on both, because
 it is a guard against a reported bypass that turned out not to reproduce rather than a regression
-test for a fix. The skip is
-`test_the_report_write_does_not_follow_a_symlink`: this Windows host does not permit creating a
-symlink, so that assertion has never executed. See Not verified.
+test for a fix. Ten more were added in iteration 6 for the Codex findings and all ten failed against
+the runner immediately before their fix. The two skips are `test_the_report_write_does_not_follow_a_
+symlink` and `test_the_report_write_does_not_follow_a_symlinked_temporary_file`: this Windows host
+does not permit creating a symlink, so neither assertion has ever executed. See Not verified.
 
-Verified: `python .agentic/gate.py` on this branch reports G0, G1, G2, G3, G4 and G6 pass, and G5
-failing only on the blank `Reviewer` field below, which is the framework's documented terminal
-state. G6's evidence names `specs/SPEC-0002-gate-self-bypass.md` as the declaration authorising the
-four protected files in the change.
+Verified: `python .agentic/gate.py` on this branch reports **ALL GATES PASS** — all seven, including
+G5, because the `Reviewer` field below is now filled. Earlier iterations of this document described
+G5 failing on a blank `Reviewer`, which was true then and is not now. G6's evidence names
+`specs/SPEC-0002-gate-self-bypass.md` as the declaration authorising the four protected files in the
+change, and `python .agentic/gate.py --stage ci --base main` reports
+`policy: candidate: framework maintenance declared in specs/SPEC-0002-gate-self-bypass.md`.
 
 Verified: the adversarial harness at `C:\Users\j_car\gates-stress\harness.py` re-run against this
 branch, unchanged since iteration 3. The baseline is green on all seven gates, so nothing here is a
@@ -64,8 +67,12 @@ both found the same two P0 holes, which are now fixed:
 2. **`git checkout` overwrites, it does not delete.** A pull request could add
    `.agentic/time.py`; the restore would put the base `gate.py` back and leave the added file in
    place, and Python prepends the script's directory to `sys.path`, so the runner would import the
-   attacker's module at start-up and exit zero. Both workflows now `rm -rf .agentic` before
-   restoring, and fail the job rather than continue if the restore does not succeed.
+   attacker's module at start-up and exit zero. Both workflows now `git archive` the base ref's
+   `.agentic/` into a directory **outside** the working tree and run that copy with `--root .`, so
+   nothing in the tree is overwritten, nothing added under `.agentic/` survives on the judge's
+   `sys.path`, and `set -euo pipefail` fails the job if the extraction does not succeed. An earlier
+   version of this paragraph said the workflows `rm -rf .agentic` before restoring; they never did,
+   and unpacking outside the tree is what replaced it.
 
 Also acted on: deletions of protected files were invisible to `--diff-filter=ACMR`; the maintenance
 field accepted any value starting with "yes", so it now has to be exactly `yes` or `true`; and
@@ -188,7 +195,7 @@ own subscriptions, against `git diff main...HEAD` at 3f573cd. Gemini and Kimi bo
   list skipped the coverage check. A report that records no G6 result is now never a pass, since G6
   runs at every tier and every stage.
 - **P2, Kimi: the test counts in this document and the README disagreed** (57 against 46). Both are
-  now 71, which is what the suite reports.
+  now 82, which is what the suite reports.
 
 ## Round five: the new work reviewed in turn
 
@@ -226,6 +233,69 @@ and the seventh was tested and found not to reproduce.
   tests failed on an assertion against the previous runner; three *errored* on the absent `policy`
   key, which is proof the behaviour did not exist but is not the same thing as a clean failure. Said
   accurately above and in the spec.
+
+## Round six: Codex, on the whole branch including the new work
+
+Codex refused the round-four prompt twice on OpenAI's cybersecurity content policy — once
+immediately, once after forty minutes and 225,000 tokens of real work — because the request was
+framed as adversarial review. Re-asked as a plain correctness review of the whole branch, it
+returned `VERDICT: BLOCK` with eight P0s, twelve P1s and seven P2s. It is the most productive of the
+three reviewers and it is the reason this branch went round again rather than merging.
+
+Eight P0s, all fixed, each with a test confirmed failing against the runner immediately before it:
+
+1. **`resolve_policy()` accepted a declaration the base policy would have rejected.** A change on an
+   `internal/*` branch could rewrite `[tiers.branch_patterns]` so its own branch read as production,
+   declare maintenance, and be handed the very policy its declaration was refused under. Selection
+   now requires the whole of G6 to pass under the base policy, not `declared` alone.
+2. **The tier floor and a raised `--tier` authorised framework maintenance.** Adding one
+   `paths.source` file to an internal branch raised the effective tier to production and with it the
+   right to edit the runner. Maintenance is now authorised by the **branch's** tier, kept separately
+   as `Ctx.branch_tier`; the floor still raises which gates run.
+3. **At CI stage an uncommitted declaration authorised a committed edit.** `candidate_text()` fell
+   through to the working tree when `git show HEAD:path` came back empty, and `resolve_declaration()`
+   accepted untracked specs at any stage. CI now reads only the proposed tree, `Repo.show_blob()`
+   tells an absent path from an empty file, the untracked allowance is local-only, and the CI
+   declaration diff is the committed one.
+4. **`project.base_branch` chose the base in CI.** Pointing that key at the branch's own tip made
+   the base resolve to `HEAD`, emptied the diff, and let `base_is_the_project_base()` bless it. The
+   CI fallback is now the conventional name, never the candidate's key.
+5. **A test could create the virtualenv marker mid-run.** `python_env_note()` ran during G4, after
+   G2 had executed the branch's test command, so an ignored `.venv/` created by a passing test turned
+   every existence failure into `not_applicable`. It is now part of the snapshot, resolved in
+   `resolve_integrity()` before the first gate. This is the round-four snapshot bug reappearing in a
+   different gate, which is the argument for the principle rather than the patch.
+6. **Only the first component of a dotted import was resolved**, so `import installed.no_such_thing`
+   passed whenever the parent was installed. The remaining parts are now walked on disk — not
+   imported, because importing `a.b` runs `a/__init__.py` and a gate may not run the code it judges.
+   Where the package is not observable on disk the walk says nothing.
+7. **Any `node_modules` directory with a `package.json` counted as installed**, entry point or not.
+   Resolution now follows `exports`, `main` and Node's index rules.
+8. **The report's temporary file was an unchecked write-through.** The final path was symlink-checked
+   and `.last-report.json.tmp` was not, so a symlink there was followed before `os.replace`. The
+   temporary name now carries the pid and is opened `O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW`.
+
+Twelve P1s: eight fixed — `find_spec` now catches anything a meta-path finder raises rather than a
+guessed list; `python_env_note()` looks for the active environment across every candidate before
+settling for a foreign one; `dir_has_importable()` no longer prunes `build`, `dist` or `env` inside a
+package and walks on a node budget rather than a fixed depth; `local_python_modules()` compares
+repository-relative parts, so an ancestor directory named `build` no longer blanks the scan, and adds
+a directory name only when it is a real package, closing "drop one .py file into a directory named
+after the package"; installed distribution metadata now maps import names to distributions, so
+`google-cloud-storage` declares `google`; `requirements.txt` understands `-e`, `#egg=` and URL
+requirements; a root-level compiled extension counts as local; and a malformed `agentic.toml` exits
+with a message instead of a traceback. Node resolution walks up from the importing file, so a
+workspace layout resolves the way Node resolves it.
+
+Four P1s and three P2s recorded rather than fixed, each with the reason, in the spec's Out of scope:
+`is_protected()` case-folds unconditionally (a false positive that fails safe, and the alternative
+reopens the bypass it was added for); a CI file counts as gate-bearing on a substring
+(over-protection); `dir_has_importable()` has a depth and node budget; and the remaining path-quoting
+cases beyond non-ASCII. The four documentation P2s are corrected in place: the stale "the policy read
+is deliberately the branch's `agentic.toml`" paragraph in the spec, the `rm -rf .agentic` claim above
+that the workflows never made true, the stale "G5 failing only on the blank `Reviewer` field", and
+the merge-base wording. The Azure pipeline now guards the trusted-runner path on
+`Build.Reason = PullRequest`, which is what the documentation already claimed.
 
 ## Not verified
 
@@ -271,8 +341,10 @@ open — was worse.
 
 Not verified: the fourth review round ran against `git diff main...HEAD` at 3f573cd, which is the
 diff **before** the three decisions and the round-four fixes were written. The 3,000 lines added
-after it have been through the gates, the 67 tests and the stress harness, but not through an
-external model. Codex was still running when this was written; see below.
+after it were reviewed in rounds five and six: Gemini and Kimi on the round-five diff, Codex on the
+whole branch in round six. What has NOT been through an external model is the round-six work itself,
+about 400 lines of fixes to Codex's own findings, which have been through the gates, the 82 tests and
+the stress harness only.
 
 ## Review
 

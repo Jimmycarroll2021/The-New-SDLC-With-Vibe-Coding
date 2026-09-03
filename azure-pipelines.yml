@@ -20,7 +20,13 @@ steps:
       # A pull request validation build is a merge commit, so its first parent is the exact base
       # that was merged. That needs no fetch and no persisted credentials, and it does not move if
       # the target branch advances mid-run.
-      BASE_SHA=$(git rev-parse --verify --quiet "HEAD^1" || true)
+      # Only a pull request validation build is a merge commit. On an ordinary push HEAD^1 is the
+      # previous commit on the same branch, which is not a base to be judged against, so the
+      # trusted-runner path is guarded on the build reason rather than on HEAD^1 existing.
+      BASE_SHA=""
+      if [ "$(Build.Reason)" = "PullRequest" ]; then
+        BASE_SHA=$(git rev-parse --verify --quiet "HEAD^1" || true)
+      fi
       if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA:.agentic/gate.py" 2>/dev/null; then
         echo "policy, runner and CI changes proposed by this pull request:"
         git diff --stat "$BASE_SHA...HEAD" -- .agentic agentic.toml azure-pipelines.yml

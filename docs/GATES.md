@@ -131,12 +131,15 @@ it, for the same reason.
   is a spike.
 - Fails when `--tier` is passed a tier below the one the branch implies. The lower value is ignored
   and the branch's tier stands, so a lowered `--tier` cannot reduce what runs.
-- Fails when no base ref resolves: with no change set, none of the above can be checked.
+- Fails when no base ref resolves at `--stage local` or `--stage ci`: with no change set, none of
+  the above can be checked. `--stage commit` is the exception and needs no base: the index is the
+  change set there, so a `--base` that does not resolve changes nothing.
 - The change set it reads is the working tree **and** the committed diff against the base, so a CI
   step that restores the runner from the base ref does not hide the edit it protects against.
-- **At `--stage ci` the policy itself is read from the merge base** — the commit where the branch
-  diverged, not the current tip of the base branch, so the answer does not move if the target branch
-  advances mid-run. A pull request that relaxes a
+- **At `--stage ci` the policy itself is read from the merge base** with whatever the workflow pins
+  as the base — the pull request's base commit on GitHub, the merge build's first parent on Azure.
+  Both are fixed for the run, so the answer does not move if the target branch advances mid-run, and
+  with a PR base pinned that way the merge base is that same commit. A pull request that relaxes a
   rule is judged by the rule it replaces rather than by its replacement. The exception is the same
   authorising channel as above: when the change declares `Framework maintenance: yes` in the
   G0-valid spec it references, with the declaration in this diff, the candidate's own `agentic.toml`

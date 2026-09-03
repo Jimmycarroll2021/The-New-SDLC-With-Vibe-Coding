@@ -438,7 +438,49 @@ class EndToEnd(unittest.TestCase):
         self.fx.write("notes/app.ts", "import x from 'leftpad-hallucinated';\n")
         g4 = self.fx.result(self.fx.run(), "G4")
         self.assertEqual(g4["status"], "fail")
-        self.assertTrue(any("no importable module" in e for e in g4["evidence"]), g4["evidence"])
+        self.assertTrue(any("nothing Node could load" in e for e in g4["evidence"]), g4["evidence"])
+
+    def test_g4_rejects_a_js_package_whose_manifest_has_no_entry_point(self):
+        self.fx.branch("proto/js-noentry")
+        self.fx.write("package.json", json.dumps({"dependencies": {"hollow-pkg": "0"}}))
+        self.fx.write("node_modules/hollow-pkg/package.json", "{}")
+        self.fx.write("notes/app.ts", "import x from 'hollow-pkg';\n")
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertEqual(g4["status"], "fail", g4["evidence"])
+
+    def test_g4_resolves_the_whole_dotted_import_not_only_its_first_part(self):
+        """An installed parent package does not make every submodule of it real."""
+        self.assertIsNone(gate.python_module_exists("json", "json.decoder"))
+        why = gate.python_module_exists("json", "json.this_submodule_does_not_exist")
+        self.assertIsNotNone(why)
+        self.assertIn("does not exist in it", why)
+
+    def test_g4_a_directory_holding_one_py_file_is_not_a_package(self):
+        """A directory only counts as a local module when it is really a package. Otherwise
+        dropping any .py file into a directory named after the package is the empty-directory
+        bypass with one extra step."""
+        self.fx.branch("proto/fakelocal")
+        self.fx.write("docs/quantum_billing_toolkit/helper.py", "X = 1\n")
+        self.fx.write("notes/fetch.py", "import quantum_billing_toolkit\n")
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertEqual(g4["status"], "fail", g4["evidence"])
+
+    def test_g4_does_not_prune_package_components_named_build_or_env(self):
+        """`build`, `dist` and `env` are ordinary submodule names inside a package."""
+        self.fx.branch("proto/vendorbuild")
+        self.fx.write("vendor/build/__init__.py", "")
+        self.fx.write("notes/use.py", "import vendor\n")
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertEqual(g4["status"], "pass", g4["evidence"])
+
+    def test_g4_reads_an_editable_requirement_as_a_declaration(self):
+        names, manifests = gate.declared_python_deps(self.fx.root, {})
+        self.assertEqual(names, set())
+        self.fx.write("requirements.txt",
+                      "-e ../sharedlib\ngit+https://example.invalid/x.git#egg=vcs_pkg\n")
+        names, manifests = gate.declared_python_deps(self.fx.root, {})
+        self.assertIn("sharedlib", names)
+        self.assertIn("vcs_pkg", names)
 
     def test_g4_local_module_import_is_fine(self):
         self.fx.branch("proto/local")
@@ -640,6 +682,118 @@ class Integrity(unittest.TestCase):
             self.assertEqual(g6["status"], "fail", (stage, rep["policy"], g6["evidence"]))
             self.assertTrue(any("internal" in e for e in g6["evidence"]), (stage, g6["evidence"]))
             self.assertFalse(rep["ok"], stage)
+
+    def test_the_tier_floor_does_not_authorise_editing_the_runner(self):
+        """Round six, Codex P0: the floor raises the tier so the right gates run, but framework
+        maintenance is authorised by the BRANCH's tier. Otherwise adding a source file, or passing
+        --tier production, turns a spike branch into a place the runner can be edited from."""
+        self.fx.branch("internal/SPEC-0007-thing")
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC.replace(
+            "Risk tier: production", "Risk tier: production\nFramework maintenance: yes", 1))
+        self.fx.write("handoffs/HANDOFF-0007.md", GOOD_HANDOFF)
+        self.fx.write("src/thing.py", "import json\n")
+        self.fx.write("tests/test_thing.py", "def test_f():\n    pass\n")
+        self.fx.write(".agentic/gate.py", "# stand-in\n# tampered\n")
+        rep = self.fx.run()
+        self.assertEqual(rep["tier"], "production")                 # the floor still applies
+        g6 = self.fx.result(rep, "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+        self.assertTrue(any("'internal' branch" in e for e in g6["evidence"]), g6["evidence"])
+        raised = self.fx.run(tier="production")                     # nor does raising it by hand
+        self.assertEqual(self.fx.result(raised, "G6")["status"], "fail")
+
+    def test_ci_will_not_take_the_candidate_policy_the_base_policy_would_reject(self):
+        """Round six, Codex P0: declaring maintenance is not on its own enough to be handed the
+        candidate's own policy. A change that rewrites [tiers.branch_patterns] so its internal
+        branch reads as production would otherwise be judged by the very rewrite."""
+        self.fx.branch("internal/SPEC-0007-thing")
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC.replace(
+            "Risk tier: production", "Risk tier: production\nFramework maintenance: yes", 1))
+        self.fx.write("handoffs/HANDOFF-0007.md", GOOD_HANDOFF)
+        toml = (self.fx.root / "agentic.toml").read_text(encoding="utf-8")
+        self.fx.write("agentic.toml", toml.replace('production = ["main", "feature/*"]',
+                                                   'production = ["main", "feature/*", "internal/*"]'))
+        self.fx.commit("reclassify my own branch, then declare maintenance")
+        rep = gate.run(self.fx.root, "ci", "main", None)
+        self.assertIn("base ref", rep["policy"])
+        g6 = self.fx.result(rep, "G6")
+        self.assertEqual(g6["status"], "fail", (rep["policy"], g6["evidence"]))
+        self.assertFalse(rep["ok"])
+
+    def test_ci_will_not_take_a_declaration_that_is_not_in_the_proposed_tree(self):
+        """Round six, Codex P0: at CI stage the proposed tree is the candidate. A declaration that
+        exists only in the working tree is not part of what the pull request proposes."""
+        self.fx.branch("feature/SPEC-0007-thing")
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC)
+        self.fx.write("handoffs/HANDOFF-0007.md", GOOD_HANDOFF)
+        self.fx.write(".agentic/gate.py", "# stand-in\n# tampered\n")
+        self.fx.commit("edit the runner, declare nothing")
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC.replace(
+            "Risk tier: production", "Risk tier: production\nFramework maintenance: yes", 1))
+        g6 = self.fx.result(gate.run(self.fx.root, "ci", "main", None), "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+        self.fx.write("specs/SPEC-0007-untracked.md", GOOD_SPEC.replace(
+            "Risk tier: production", "Risk tier: production\nFramework maintenance: yes", 1))
+        g6 = self.fx.result(gate.run(self.fx.root, "ci", "main", None), "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+
+    def test_ci_does_not_take_its_base_branch_from_the_candidates_own_policy(self):
+        """Round six, Codex P0: project.base_branch lives in the file the change may be editing.
+        Pointing it at the branch's own tip emptied the diff, which is a skip flag."""
+        self.fx.branch("feature/SPEC-0007-thing")
+        toml = (self.fx.root / "agentic.toml").read_text(encoding="utf-8")
+        self.fx.write("agentic.toml", toml.replace('base_branch = "main"',
+                                                   'base_branch = "feature/SPEC-0007-thing"'))
+        self.fx.commit("judge me against myself")
+        ci_vars = {"GITHUB_BASE_REF": "", "GITHUB_WORKSPACE": "", "GITHUB_HEAD_REF": "",
+                   "GITHUB_REF_NAME": "", "SYSTEM_PULLREQUEST_TARGETBRANCH": "",
+                   "SYSTEM_PULLREQUEST_SOURCEBRANCH": "", "BUILD_SOURCESDIRECTORY": "",
+                   "BUILD_SOURCEBRANCHNAME": ""}
+        with mock.patch.dict(os.environ, ci_vars):
+            rep = gate.run(self.fx.root, "ci", None, None)
+        self.assertEqual(rep["base"], "main")
+        g6 = self.fx.result(rep, "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+        self.assertTrue(any("agentic.toml" in e for e in g6["evidence"]), g6["evidence"])
+
+    def test_a_virtualenv_the_test_run_creates_does_not_disable_the_existence_check(self):
+        """Round six, Codex P0: the environment decision is part of the snapshot. G2 runs the
+        branch's own test command, so a test that creates a virtualenv marker would otherwise turn
+        every G4 existence failure into not_applicable."""
+        full_production_setup(self.fx)
+        self.fx.write(".gitignore", ".venv/\n")
+        self.fx.write("requirements.txt", "totallynotapackage==1.0\n")
+        self.fx.write("src/thing.py", "import totallynotapackage\n")
+        self.fx.write("mkvenv.py", textwrap.dedent("""\
+            import pathlib
+            p = pathlib.Path('.venv'); (p / 'Lib' / 'site-packages').mkdir(parents=True, exist_ok=True)
+            (p / 'pyvenv.cfg').write_text('home = /usr/bin\\n', encoding='utf-8')
+            """))
+        toml = (self.fx.root / "agentic.toml").read_text(encoding="utf-8")
+        self.fx.write("agentic.toml", "\n".join(
+            'command = "python mkvenv.py"' if l.startswith('command = "python -c') else l
+            for l in toml.splitlines()) + "\n")
+        rep = self.fx.run()
+        self.assertTrue((self.fx.root / ".venv/pyvenv.cfg").is_file(),
+                        "the test command did not run, so this proves nothing")
+        g4 = self.fx.result(rep, "G4")
+        self.assertEqual(g4["status"], "fail", g4["evidence"])
+        self.assertTrue(any("not installed" in e for e in g4["evidence"]), g4["evidence"])
+
+    def test_the_report_write_does_not_follow_a_symlinked_temporary_file(self):
+        full_production_setup(self.fx)
+        victim = self.fx.root / "agentic.toml"
+        link = self.fx.root / ".agentic" / f".last-report.{os.getpid()}.tmp"
+        try:
+            link.parent.mkdir(exist_ok=True)
+            os.symlink(victim, link)
+        except (OSError, NotImplementedError, AttributeError) as e:
+            self.skipTest(f"this host does not permit creating symlinks: {e}")
+        before = victim.read_text(encoding="utf-8")
+        subprocess.run([sys.executable, str(ROOT / ".agentic/gate.py"), "--root", str(self.fx.root),
+                        "--base", "main"], capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(victim.read_text(encoding="utf-8"), before,
+                         "the report was written through the temporary symlink, into the policy")
 
     def test_the_tier_floor_leaves_a_branch_that_carries_no_source_alone(self):
         self.fx.branch("proto/idea")
