@@ -16,10 +16,52 @@ jobs:
         with:
           python-version: "3.11"
       # Add your own dependency install here if tests.command needs it (pip install -r requirements.txt, npm ci ...)
-      - name: Run gates
-        run: python .agentic/gate.py --stage ci
-        # GITHUB_BASE_REF / GITHUB_HEAD_REF are read automatically. On a PR this is a diff against
-        # the target branch; on a push to main it is a whole-tree audit.
+      - name: Run gates, judged by the base ref's runner and the base ref's policy
+        # The judge must never be the branch's own copy, or a change that rewrites agentic.toml or
+        # gate.py is graded by its own rewrite. The base ref's runner is unpacked OUTSIDE the working
+        # tree and pointed at it with --root, which matters three ways:
+        #   - the branch's own tests still import the branch's runner, so a change to the runner can
+        #     still be tested by the change that makes it;
+        #   - sys.path[0] is the trusted directory, so a Python file added under .agentic/ and named
+        #     after a standard library module cannot be imported by the judge;
+        #   - nothing in the working tree is modified, so the diff the gates read is the real one.
+        #
+        # The POLICY is restored from the base ref too, but by the runner rather than by this file.
+        # At --stage ci the trusted gate.py reads agentic.toml from the base commit, so a pull
+        # request that relaxes a rule is judged by the rule it replaces. The one exception is a
+        # change that declares "Framework maintenance: yes" in the G0-valid spec it references, with
+        # the declaration present in this diff: then the candidate's own agentic.toml is used, so a
+        # policy change can still be exercised by the change proposing it. That question is asked
+        # while the base policy is in force, so the candidate cannot steer it. The report prints a
+        # "policy:" line, so the log records which was used.
+        #
+        # Doing it in the runner and not here is the point: on a pull_request event this file comes
+        # from the pull request, so a restore written in YAML is a rule the candidate carries. The
+        # runner is unpacked from the base ref and is not.
+        #
+        # This step cannot protect THIS FILE: on a pull_request event the workflow comes from the
+        # pull request. What makes the gate binding is a ruleset on the base branch requiring the
+        # "gates" check (the job id, not the workflow name), with "Require review from Code Owners"
+        # enabled and CODEOWNERS covering .github/workflows/, .agentic/ and agentic.toml. A skipped
+        # job counts as a successful required check, so do not add paths-ignore here.
+        run: |
+          set -euo pipefail
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA:.agentic/gate.py" 2>/dev/null; then
+            echo "policy, runner and CI changes proposed by this pull request:"
+            git diff --stat "$BASE_SHA...HEAD" -- .agentic agentic.toml .github/workflows
+            TRUSTED="$RUNNER_TEMP/trusted-gates"
+            mkdir -p "$TRUSTED"
+            git archive "$BASE_SHA" .agentic | tar -x -C "$TRUSTED"
+            echo "judging with .agentic/gate.py AND agentic.toml as they exist at $BASE_SHA,"
+            echo "unless this change declares framework maintenance in the spec it references"
+            python "$TRUSTED/.agentic/gate.py" --root . --stage ci --base "$BASE_SHA"
+          else
+            echo "no runner on the base ref (first install), or not a pull request: using this tree's own"
+            python .agentic/gate.py --stage ci
+          fi
+        # On push, main is compared to itself and only the tree-wide checks (G1, G2 run, G4 on
+        # untracked) are meaningful. Direct pushes to a protected branch are branch protection's job.
       - name: Upload gate report
         if: always()
         uses: actions/upload-artifact@v4

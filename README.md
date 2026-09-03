@@ -85,14 +85,26 @@ that, a direct push meets only the hook's two cheap gates, and the other four ar
 | **G1 context** | `AGENTS.md` missing, over the line cap, missing a section, untracked, or leaking a secret | "start with ten lines"; "treat AGENTS.md as code" |
 | **G2 tests** | source changed without a test change, or the test command fails | "tests verify the deterministic parts" (G2 proves *alongside*; a diff cannot prove *before*) |
 | **G3 evals** | AI-surface change below the pass rate, too few cases, no rubric, or a stub target | "evals verify the parts that are not deterministic"; "an eval without a rubric measures nothing" |
-| **G4 review** | secret pattern in an added line; `.env`/`.pem` in the diff; an import that is not stdlib, local or declared | "check imports for real packages"; the hook that blocks a hard-coded password |
+| **G4 review** | secret pattern in an added line; `.env`/`.pem` in the diff; an import that is not stdlib, not local, not declared, or declared but resolving to nothing in the environment | "check imports for real packages"; the hook that blocks a hard-coded password |
 | **G5 handoff** | no `handoffs/HANDOFF-*.md` in the change, or a required field is a placeholder | "traces of every agent run"; "clear handoff protocols" |
+| **G6 integrity** | the change edits `agentic.toml`, `.agentic/` or a CI definition that runs the gate, without a spec that declares framework maintenance; `--tier` is used to lower the tier; or no base ref resolves | a control point an agent can rewrite is not a control point |
 
 | Tier | Default branches | Gates |
 |---|---|---|
 | prototype | `proto/*` `spike/*` `sandbox/*` | G4 |
 | internal | `internal/*` `tooling/*` `docs/*` | G1 G2 G4 |
 | production | `main` `release/*` `feature/*` `fix/*` and anything else | all six |
+
+**G6 sits on top of that table, at every tier and every stage.** It is not listed in
+`[tiers.required]` and has no key of its own, because a gate that detects edits to `agentic.toml`
+cannot be switched off by editing `agentic.toml`.
+
+There is no `--skip`. If a gate should not apply, the work is on the wrong branch - and the branch
+name is checked against the diff rather than believed: a prototype- or internal-tier branch whose
+change set touches `paths.source` is judged at production tier instead. `--tier` raises the tier,
+never lowers it. In CI the policy itself is read from the merge base, so a pull request that relaxes
+a rule is judged by the rule it replaces, unless it declares framework maintenance in the spec it
+references.
 
 Full detail per gate, with what each one deliberately does not do: [`docs/GATES.md`](docs/GATES.md).
 

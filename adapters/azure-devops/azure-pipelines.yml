@@ -15,9 +15,46 @@ steps:
     inputs:
       versionSpec: "3.11"
   # Add dependency installs here if tests.command needs them
-  - script: python .agentic/gate.py --stage ci
+  - script: |
+      set -euo pipefail
+      # A pull request validation build is a merge commit, so its first parent is the exact base
+      # that was merged. That needs no fetch and no persisted credentials, and it does not move if
+      # the target branch advances mid-run.
+      # Only a pull request validation build is a merge commit. On an ordinary push HEAD^1 is the
+      # previous commit on the same branch, which is not a base to be judged against, so the
+      # trusted-runner path is guarded on the build reason rather than on HEAD^1 existing.
+      BASE_SHA=""
+      if [ "$(Build.Reason)" = "PullRequest" ]; then
+        BASE_SHA=$(git rev-parse --verify --quiet "HEAD^1" || true)
+      fi
+      if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA:.agentic/gate.py" 2>/dev/null; then
+        echo "policy, runner and CI changes proposed by this pull request:"
+        git diff --stat "$BASE_SHA...HEAD" -- .agentic agentic.toml azure-pipelines.yml
+        TRUSTED="$(Agent.TempDirectory)/trusted-gates"
+        mkdir -p "$TRUSTED"
+        git archive "$BASE_SHA" .agentic | tar -x -C "$TRUSTED"
+        echo "judging with .agentic/gate.py AND agentic.toml as they exist at $BASE_SHA,"
+        echo "unless this change declares framework maintenance in the spec it references"
+        python "$TRUSTED/.agentic/gate.py" --root . --stage ci --base "$BASE_SHA"
+      else
+        echo "no runner on the base ref (first install), or not a merge build: using this tree's own"
+        python .agentic/gate.py --stage ci
+      fi
     displayName: agentic gates
-    # System.PullRequest.TargetBranch and SourceBranch are read automatically
+    # The judge must never be the branch's own copy, so the base ref's runner is unpacked outside
+    # the working tree and pointed at it.
+    #
+    # The policy is restored from the base ref too, but by the runner rather than by this file: at
+    # --stage ci the trusted gate.py reads agentic.toml from the base commit, so a change that
+    # relaxes a rule is judged by the rule it replaces. A change that declares
+    # "Framework maintenance: yes" in the G0-valid spec it references, with the declaration in this
+    # diff, is judged by its own agentic.toml instead, so a policy change can be exercised by the
+    # change proposing it. The report prints a "policy:" line saying which was used. It is done in
+    # the runner because this file comes from the branch and the runner does not.
+    #
+    # This cannot protect this file: the pipeline definition comes from the branch. Use a branch
+    # policy that requires this build and required reviewers on azure-pipelines.yml, .agentic/ and
+    # agentic.toml.
   - publish: .agentic/last-report.json
     artifact: agentic-gate-report
     condition: always()

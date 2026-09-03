@@ -120,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         code, out = run_agent(agent_cmd, prompt, run_dir / f"iter-{i}.prompt.md", root, a.agent_timeout)
         (run_dir / f"iter-{i}.agent.log").write_text(out, encoding="utf-8")
         print(f"[loop] agent exited {code} after {time.time() - t0:.0f}s; running gates")
-        rep = gate.run(root, "local", a.base, a.tier)
+        rep = gate.enforce_verdict(gate.run(root, "local", a.base, a.tier))
         (run_dir / f"iter-{i}.gates.json").write_text(json.dumps(rep, indent=2), encoding="utf-8")
         text = report_text(rep)
         print(text)
