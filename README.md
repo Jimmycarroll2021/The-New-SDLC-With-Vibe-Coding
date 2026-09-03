@@ -28,8 +28,9 @@ The last line is the point. A gate says pass or fail with evidence. It never say
 | **G1 context** | `AGENTS.md` missing, over the line limit, missing a section, untracked, or leaking a secret | "start with ten lines"; "treat AGENTS.md as code" |
 | **G2 tests** | source changed without a test change, or the test command fails | "tests verify the deterministic parts"; enforces tests *alongside* code (a diff cannot prove *before*) |
 | **G3 evals** | an AI-surface change scores below the bar, has too few cases, no rubric, or a stub target | "evals verify the parts that are not deterministic"; "the bar is the eval, not the demo" |
-| **G4 review** | a secret pattern in an added line, a `.env`/`.pem` in the diff, or an import that is not stdlib, local, or declared | "check imports for real packages"; the hook that blocks the hard-coded password |
+| **G4 review** | a secret pattern in an added line, a `.env`/`.pem` in the diff, or an import that is not stdlib, not local, not declared, or declared but resolving to nothing in the environment | "check imports for real packages"; the hook that blocks the hard-coded password |
 | **G5 handoff** | no `handoffs/HANDOFF-*.md` in the change, or a required field is a placeholder | "traces of every agent run"; "clear handoff protocols" |
+| **G6 integrity** | the change edits `agentic.toml`, `.agentic/` or a CI definition that runs the gate, without a spec that declares framework maintenance; `--tier` is used to lower the tier; or no base ref resolves | a control point an agent can rewrite is not a control point |
 
 Which gates apply is decided by **risk tier**, derived from the branch name in `agentic.toml`:
 
@@ -39,7 +40,15 @@ Which gates apply is decided by **risk tier**, derived from the branch name in `
 | internal | `internal/*` `tooling/*` `docs/*` | G1 G2 G4 |
 | production | `main` `release/*` `feature/*` `fix/*` and anything else | all six |
 
-There is no `--skip`. If a gate should not apply, the work is on the wrong branch.
+**G6 is on top of that table, at every tier and every stage.** It is not listed in
+`[tiers.required]` and has no key of its own, because a gate that detects edits to `agentic.toml`
+cannot be switched off by editing `agentic.toml`.
+
+There is no `--skip`. If a gate should not apply, the work is on the wrong branch, and the branch
+name is checked against the diff rather than believed: a prototype- or internal-tier branch whose
+change set touches `paths.source` is judged at production tier instead. `--tier` can raise the tier,
+never lower it. In CI the policy itself comes from the base ref, so a pull request that relaxes a
+rule is judged by the rule it replaces unless it declares framework maintenance in its spec.
 
 ## Install into a repository (five minutes)
 
@@ -57,7 +66,11 @@ mkdir -p your-repo/specs your-repo/handoffs
 cd your-repo && python .agentic/hooks/install_hooks.py
 
 # 4. add CI: copy .github/workflows/agentic-gates.yml or azure-pipelines.yml, add your
-#    dependency install step before "Run gates"
+#    dependency install step. Then make it binding, or the gate is advice, because a pull
+#    request supplies its own workflow file: a ruleset on the base branch requiring the
+#    "gates" check by its JOB ID (not the workflow name), "Require review from Code Owners"
+#    switched on, and CODEOWNERS covering .github/workflows/, .agentic/ and agentic.toml.
+#    A skipped job counts as a successful required check, so do not add paths-ignore.
 
 # 5. write the first spec and run
 cp .agentic/templates/SPEC.md specs/SPEC-0001-first-change.md
@@ -117,7 +130,7 @@ agent_command = "gemini -p -"                              # or anything: {promp
 agentic.toml                     policy: tiers, paths, commands, thresholds
 AGENTS.md  CLAUDE.md  GEMINI.md  rules, and two one-line pointers to them
 .agentic/
-  gate.py                        the six gates and the runner (stdlib only)
+  gate.py                        the gates and the runner (stdlib only)
   loop.py                        agent -> gates -> route failure back
   templates/                     SPEC.md, HANDOFF.md, AGENTS.template.md, PULL_REQUEST_TEMPLATE.md
   hooks/                         pre-commit + install_hooks.py
@@ -125,7 +138,7 @@ AGENTS.md  CLAUDE.md  GEMINI.md  rules, and two one-line pointers to them
 specs/  handoffs/                one file per change, checked by G0 and G5
 docs/GATES.md                    what each gate checks and why
 adapters/                        optional per-tool conveniences
-tests/test_gate.py               26 tests; each builds a real temporary git repo
+tests/test_gate.py               82 tests; each builds a real temporary git repo
 ```
 
 ## What it deliberately does not do
