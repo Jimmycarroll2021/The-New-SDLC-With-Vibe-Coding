@@ -116,11 +116,24 @@ class Repo:
             raise RuntimeError(f"git {' '.join(args)} failed: {p.stderr.strip()}")
         return p.stdout if p.returncode == 0 else ""
 
+    def ci_env_applies(self) -> bool:
+        """CI branch variables describe the CI workspace repo only. A gate run against any other
+        repo (the test fixtures, a nested checkout) must read git, not the runner's environment."""
+        for var in ("GITHUB_WORKSPACE", "BUILD_SOURCESDIRECTORY"):
+            ws = os.environ.get(var)
+            if ws:
+                try:
+                    return Path(ws).resolve() == self.root.resolve()
+                except OSError:
+                    return False
+        return True
+
     def branch(self) -> str:
-        for var in ("GITHUB_HEAD_REF", "SYSTEM_PULLREQUEST_SOURCEBRANCH", "GITHUB_REF_NAME",
-                    "BUILD_SOURCEBRANCHNAME"):
-            if os.environ.get(var):
-                return os.environ[var].removeprefix("refs/heads/")
+        if self.ci_env_applies():
+            for var in ("GITHUB_HEAD_REF", "SYSTEM_PULLREQUEST_SOURCEBRANCH", "GITHUB_REF_NAME",
+                        "BUILD_SOURCEBRANCHNAME"):
+                if os.environ.get(var):
+                    return os.environ[var].removeprefix("refs/heads/")
         return self.git("rev-parse", "--abbrev-ref", "HEAD").strip() or "HEAD"
 
     def merge_base(self, base: str | None) -> str | None:
@@ -651,9 +664,10 @@ def run(root: Path, stage: str, base: str | None, tier_override: str | None) -> 
     if tier not in TIER_RANK:
         raise SystemExit(f"unknown tier '{tier}'. Known: {list(TIER_RANK)}")
     if base is None and stage != "commit":
-        base = (os.environ.get("GITHUB_BASE_REF") and f"origin/{os.environ['GITHUB_BASE_REF']}") \
-            or (os.environ.get("SYSTEM_PULLREQUEST_TARGETBRANCH") and
-                "origin/" + os.environ["SYSTEM_PULLREQUEST_TARGETBRANCH"].removeprefix("refs/heads/")) \
+        env = os.environ if repo.ci_env_applies() else {}
+        base = (env.get("GITHUB_BASE_REF") and f"origin/{env['GITHUB_BASE_REF']}") \
+            or (env.get("SYSTEM_PULLREQUEST_TARGETBRANCH") and
+                "origin/" + env["SYSTEM_PULLREQUEST_TARGETBRANCH"].removeprefix("refs/heads/")) \
             or cfg.get("project", {}).get("base_branch", "main")
         if base and not repo.git("rev-parse", "--verify", "--quiet", base).strip():
             for alt in (f"origin/{base}", base.removeprefix("origin/")):
