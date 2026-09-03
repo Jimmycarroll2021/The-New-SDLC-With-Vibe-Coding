@@ -4,6 +4,7 @@ exercised the way they run in practice, against git's own view of the change set
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -793,9 +794,12 @@ class Integrity(unittest.TestCase):
             os.symlink(victim, link)
         except (OSError, NotImplementedError, AttributeError) as e:
             self.skipTest(f"this host does not permit creating symlinks: {e}")
+        self.assertTrue(link.is_symlink(), "the symlink was not created, so this proves nothing")
         before = victim.read_text(encoding="utf-8")
-        subprocess.run([sys.executable, str(ROOT / ".agentic/gate.py"), "--root", str(self.fx.root),
-                        "--base", "main"], capture_output=True, text=True, encoding="utf-8")
+        # in-process, not a subprocess: the temporary name carries os.getpid(), so a subprocess
+        # writes under a different pid and touches neither the link nor the path it stands on
+        with mock.patch.object(sys, "stdout", io.StringIO()):
+            gate.main(["--root", str(self.fx.root), "--base", "main"])
         self.assertEqual(victim.read_text(encoding="utf-8"), before,
                          "the report was written through the temporary symlink, into the policy")
 
@@ -1131,6 +1135,324 @@ class Loop(unittest.TestCase):
             self.assertEqual([it["fails"] for it in trace["iterations"]], [["G5"], ["G5"]])
         finally:
             fx.close()
+
+
+class Round7(unittest.TestCase):
+    """Findings from the seventh external review round, on the round-six fix commits.
+
+    Every test here failed against the runner immediately before its fix landed.
+    """
+
+    def setUp(self):
+        self.fx = RepoFixture()
+
+    def tearDown(self):
+        self.fx.close()
+
+    # --- a file module cannot carry submodules -------------------------------------
+    def test_a_dotted_import_through_a_file_module_cannot_resolve(self):
+        """`json.decoder` is a .py file, so `json.decoder.anything` does not exist. The walk used
+        to set found=True without descending, leaving locs empty, and the next turn read that as
+        'not observable on disk' and passed."""
+        why = gate.python_module_exists("json", "json.decoder.no_such_child")
+        self.assertIsNotNone(why, "a submodule of a file module was reported as real")
+        self.assertIn("not a package", why)
+
+    def test_a_top_level_file_module_cannot_carry_submodules_either(self):
+        why = gate.python_module_exists("base64", "base64.no_such_child")
+        self.assertIsNotNone(why, "a submodule of a top-level file module was reported as real")
+        self.assertIn("not a package", why)
+
+    def test_a_module_that_publishes_its_own_submodule_still_resolves(self):
+        """os is a module, not a package, but os.py registers os.path in sys.modules. Observing
+        the filesystem is not enough to call that import hallucinated."""
+        self.assertIsNone(gate.python_module_exists("os", "os.path"))
+
+    def test_a_real_dotted_package_import_still_resolves(self):
+        self.assertIsNone(gate.python_module_exists("json", "json.decoder"))
+        self.assertIsNone(gate.python_module_exists("collections", "collections.abc"))
+
+    # --- G4 reads the candidate, not what the branch's own test command left behind --
+    def test_g2_cannot_rewrite_the_source_g4_then_reads(self):
+        """G2 runs the branch's own test command. If G4 reads the working tree afterwards, a test
+        that rewrites the offending file turns a committed bad import into a G4 pass."""
+        self.fx.branch("feature/SPEC-0007-thing")
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC)
+        self.fx.write("handoffs/HANDOFF-0007.md", GOOD_HANDOFF)
+        self.fx.write("src/thing.py", "import totally_hallucinated_pkg\n")
+        self.fx.write("tests/test_thing.py", "def test_f():\n    pass\n")
+        toml = (self.fx.root / "agentic.toml").read_text(encoding="utf-8").replace(
+            'command = "python -c \\"import sys; sys.exit(0)\\""',
+            'command = "python -c \\"import pathlib; '
+            'pathlib.Path(\'src/thing.py\').write_text(\'import json\\\\n\')\\""')
+        self.fx.write("agentic.toml", toml)
+        self.fx.commit("a candidate whose test command launders its own source")
+        rep = self.fx.run()
+        self.assertEqual(git(self.fx.root, "show", "HEAD:src/thing.py").strip(),
+                         "import totally_hallucinated_pkg", "the committed source should be untouched")
+        g4 = self.fx.result(rep, "G4")
+        self.assertEqual(g4["status"], "fail", g4["evidence"])
+        self.assertTrue(any("totally_hallucinated_pkg" in e for e in g4["evidence"]), g4["evidence"])
+
+    # --- a declaration is renewed by the line this change adds, not by an old one ----
+    def test_an_added_line_does_not_renew_an_older_declaration_above_it(self):
+        """field_value reads the first occurrence in the file, while the diff check only asked
+        whether some line naming the field was added. A fenced 'no' therefore renewed an old yes."""
+        old = GOOD_SPEC.replace("Risk tier: production",
+                                "Risk tier: production\nFramework maintenance: yes")
+        self.fx.write("specs/SPEC-0007-thing.md", old)
+        self.fx.commit("a maintenance spec that landed long ago")
+        self.fx.branch("feature/SPEC-0007-thing")
+        self.fx.write("specs/SPEC-0007-thing.md", old + "\n```\nFramework maintenance: no\n```\n")
+        self.fx.write(".agentic/gate.py", "# the runner, edited by this change\nX = 1\n")
+        self.fx.commit("edit the runner on the back of an old permission")
+        ctx = gate.build_ctx(gate.Repo(self.fx.root), gate.load_config(self.fx.root),
+                             "local", "main", None)
+        declared, _ = gate.resolve_declaration(ctx)
+        self.assertIsNone(declared, "an old declaration was renewed by a line that does not declare")
+
+    def test_a_declaration_this_change_actually_adds_is_still_honoured(self):
+        self.fx.branch("feature/SPEC-0007-thing")
+        self.fx.write("specs/SPEC-0007-thing.md",
+                      GOOD_SPEC.replace("Risk tier: production",
+                                        "Risk tier: production\nFramework maintenance: yes"))
+        self.fx.write(".agentic/gate.py", "# the runner, edited by this change\nX = 1\n")
+        self.fx.commit("declared framework maintenance")
+        ctx = gate.build_ctx(gate.Repo(self.fx.root), gate.load_config(self.fx.root),
+                             "local", "main", None)
+        declared, notes = gate.resolve_declaration(ctx)
+        self.assertEqual(declared, "specs/SPEC-0007-thing.md", notes)
+
+    # --- in CI the candidate policy is the committed one ----------------------------
+    def test_an_uncommitted_policy_does_not_choose_the_gate_list_in_ci(self):
+        """Once maintenance is declared the candidate's own policy applies. It has to be the
+        policy the candidate is proposing, not whatever the checkout happens to hold."""
+        self.fx.branch("feature/SPEC-0007-thing")
+        self.fx.write("specs/SPEC-0007-thing.md",
+                      GOOD_SPEC.replace("Risk tier: production",
+                                        "Risk tier: production\nFramework maintenance: yes"))
+        self.fx.write("handoffs/HANDOFF-0007.md", GOOD_HANDOFF)
+        self.fx.write(".agentic/gate.py", "# a declared maintenance edit\nX = 1\n")
+        self.fx.write("tests/test_thing.py", "def test_f():\n    pass\n")
+        self.fx.commit("declared framework maintenance")
+        toml = (self.fx.root / "agentic.toml").read_text(encoding="utf-8").replace(
+            'production = ["G0", "G1", "G2", "G3", "G4", "G5"]', "production = []")
+        self.fx.write("agentic.toml", toml)          # deliberately NOT committed
+        rep = gate.run(self.fx.root, "ci", "main", None)
+        self.assertNotEqual(rep["required_gates"], ["G6"],
+                            "an uncommitted agentic.toml emptied the gate list")
+        self.assertIn("G0", rep["required_gates"])
+
+    # --- valid framework maintenance may re-tier its own branch pattern -------------
+    def test_declared_maintenance_may_move_its_own_branch_pattern(self):
+        """The tier that decides whether the runner may be edited is the tier in force, which is
+        the base ref's. Recomputing it from the candidate rejected the very change that moves it."""
+        self.fx.branch("feature/SPEC-0007-thing")
+        self.fx.write("specs/SPEC-0007-thing.md",
+                      GOOD_SPEC.replace("Risk tier: production",
+                                        "Risk tier: production\nFramework maintenance: yes"))
+        self.fx.write("handoffs/HANDOFF-0007.md", GOOD_HANDOFF)
+        self.fx.write("tests/test_thing.py", "def test_f():\n    pass\n")
+        toml = (self.fx.root / "agentic.toml").read_text(encoding="utf-8")
+        toml = toml.replace('internal = ["internal/*"]', 'internal = ["internal/*", "feature/*"]')
+        toml = toml.replace('production = ["main", "feature/*"]', 'production = ["main"]')
+        self.fx.write("agentic.toml", toml)
+        self.fx.commit("policy change: feature branches become internal")
+        rep = gate.run(self.fx.root, "ci", "main", None)
+        g6 = self.fx.result(rep, "G6")
+        self.assertEqual(g6["status"], "pass", g6["evidence"])
+
+    def test_a_prototype_branch_still_may_not_edit_the_runner(self):
+        self.fx.branch("proto/sneaky")
+        self.fx.write(".agentic/gate.py", "# edited from a spike\nX = 1\n")
+        self.fx.commit("edit the runner from a spike")
+        g6 = self.fx.result(gate.run(self.fx.root, "ci", "main", None), "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+
+    # --- a commented-out requirement declares nothing --------------------------------
+    def test_a_commented_out_requirement_is_not_a_declaration(self):
+        """`#egg=` was searched before the comment was stripped, so a commented-out line declared
+        any already-installed package."""
+        self.fx.branch("proto/egg")
+        self.fx.write("requirements.txt", "# we took this out  #egg=packaging\n")
+        self.fx.write("notes/a.py", "import packaging\n")
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertEqual(g4["status"], "fail", g4["evidence"])
+        self.assertTrue(any("not declared" in e for e in g4["evidence"]), g4["evidence"])
+
+    def test_a_real_vcs_requirement_still_declares_itself(self):
+        """Whether the package is installed on this host is not the point and would make the test
+        environment-dependent. The point is that the #egg= fragment was read as a declaration, so
+        the only thing G4 has left to say about it is that it is not installed."""
+        self.fx.branch("proto/vcs")
+        self.fx.write("requirements.txt",
+                      "git+https://example.invalid/x.git#egg=some_vcs_only_package\n")
+        self.fx.write("notes/a.py", "import some_vcs_only_package\n")
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertFalse(any("not declared" in e for e in g4["evidence"]), g4["evidence"])
+        self.assertTrue(any("not installed" in e for e in g4["evidence"]), g4["evidence"])
+
+    # --- an exports map naming nothing that exists is not a loadable package ---------
+    def test_g4_rejects_a_js_package_whose_exports_target_is_absent(self):
+        self.fx.branch("proto/jsexports")
+        self.fx.write("package.json", json.dumps({"dependencies": {"ghost-pkg": "0"}}))
+        self.fx.write("node_modules/ghost-pkg/package.json",
+                      json.dumps({"exports": "./does-not-exist.js"}))
+        self.fx.write("notes/app.ts", "import x from 'ghost-pkg';\n")
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertEqual(g4["status"], "fail", g4["evidence"])
+
+    def test_g4_accepts_a_js_package_whose_exports_target_is_present(self):
+        self.fx.branch("proto/jsexports2")
+        self.fx.write("package.json", json.dumps({"dependencies": {"real-pkg": "0"}}))
+        self.fx.write("node_modules/real-pkg/package.json",
+                      json.dumps({"exports": {".": {"import": "./lib/i.mjs", "require": "./lib/i.cjs"}}}))
+        self.fx.write("node_modules/real-pkg/lib/i.mjs", "export default {};\n")
+        self.fx.write("node_modules/real-pkg/lib/i.cjs", "module.exports = {};\n")
+        self.fx.write("notes/app.ts", "import x from 'real-pkg';\n")
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertEqual(g4["status"], "pass", g4["evidence"])
+
+    def test_g4_does_not_fail_a_js_package_whose_exports_map_is_a_pattern(self):
+        """`"./*": "./src/*.js"` cannot be resolved without Node's own matcher, so the walker
+        declines to judge it rather than calling a real package hollow."""
+        self.fx.branch("proto/jsglob")
+        self.fx.write("package.json", json.dumps({"dependencies": {"glob-pkg": "0"}}))
+        self.fx.write("node_modules/glob-pkg/package.json",
+                      json.dumps({"exports": {"./*": "./src/*.js"}}))
+        self.fx.write("node_modules/glob-pkg/src/thing.js", "module.exports = {};\n")
+        self.fx.write("notes/app.ts", "import x from 'glob-pkg';\n")
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertEqual(g4["status"], "pass", g4["evidence"])
+
+    # --- the symlink guard is exercised at the path the runner actually writes -------
+    def test_the_temporary_report_file_is_not_left_behind_when_the_rename_fails(self):
+        full_production_setup(self.fx)
+        real_replace = os.replace
+
+        def boom(src, dst):
+            if str(dst).endswith("last-report.json"):
+                raise OSError("rename refused")
+            return real_replace(src, dst)
+
+        with mock.patch.object(os, "replace", boom), mock.patch.object(sys, "stdout", io.StringIO()):
+            gate.main(["--root", str(self.fx.root), "--base", "main"])
+        leftovers = list((self.fx.root / ".agentic").glob(".last-report.*.tmp"))
+        self.assertEqual(leftovers, [], f"temporary report files left on disk: {leftovers}")
+
+
+class Round7b(unittest.TestCase):
+    """The second half of the seventh round: findings the re-run surfaced.
+
+    Every test here failed against the runner immediately before its fix landed.
+    """
+
+    def setUp(self):
+        self.fx = RepoFixture()
+
+    def tearDown(self):
+        self.fx.close()
+
+    def _laundering_toml(self, statement: str) -> str:
+        toml = (self.fx.root / "agentic.toml").read_text(encoding="utf-8")
+        return toml.replace(
+            'command = "python -c \\"import sys; sys.exit(0)\\""',
+            f'command = "python -c \\"import pathlib; {statement}\\""')
+
+    # --- the secret scan is taken before the branch's own command runs ---------------
+    def test_g2_cannot_launder_a_committed_secret_before_the_scan(self):
+        self.fx.branch("feature/SPEC-0007-thing")
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC)
+        self.fx.write("handoffs/HANDOFF-0007.md", GOOD_HANDOFF)
+        token = "sk-" + "A" * 24        # concatenated so this file never trips the scan itself
+        self.fx.write("src/thing.py", f'TOKEN = "{token}"\n')
+        self.fx.write("tests/test_thing.py", "def test_f():\n    pass\n")
+        self.fx.write("agentic.toml", self._laundering_toml(
+            "pathlib.Path('src/thing.py').write_text('SAFE = True\\\\n')"))
+        self.fx.commit("a candidate whose test command launders its own secret")
+        g4 = self.fx.result(self.fx.run(), "G4")
+        self.assertEqual(git(self.fx.root, "show", "HEAD:src/thing.py").strip(),
+                         f'TOKEN = "{token}"')
+        self.assertEqual(g4["status"], "fail", g4["evidence"])
+
+    # --- G5 judges the handoff the change proposes ------------------------------------
+    def test_g2_cannot_complete_a_handoff_g5_then_reads(self):
+        self.fx.branch("feature/SPEC-0007-thing")
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC)
+        self.fx.write("handoffs/HANDOFF-0007.md", GOOD_HANDOFF.replace("Verified: gates pass",
+                                                                       "Verified: TBD"))
+        self.fx.write("src/thing.py", "import json\n")
+        self.fx.write("tests/test_thing.py", "def test_f():\n    pass\n")
+        self.fx.write("agentic.toml", self._laundering_toml(
+            "p = pathlib.Path('handoffs/HANDOFF-0007.md'); "
+            "p.write_text(p.read_text().replace('Verified: TBD', 'Verified: gates pass'))"))
+        self.fx.commit("a candidate whose test command fills in its own handoff")
+        g5 = self.fx.result(self.fx.run(), "G5")
+        self.assertIn("Verified: TBD", git(self.fx.root, "show", "HEAD:handoffs/HANDOFF-0007.md"))
+        self.assertEqual(g5["status"], "fail", g5["evidence"])
+
+    def test_a_complete_handoff_still_passes_g5(self):
+        full_production_setup(self.fx)
+        g5 = self.fx.result(self.fx.run(), "G5")
+        self.assertEqual(g5["status"], "pass", g5["evidence"])
+
+    # --- in CI an untracked file is not part of what is proposed ----------------------
+    def test_an_untracked_spec_and_handoff_do_not_satisfy_g0_and_g5_in_ci(self):
+        """In CI the candidate is the proposed tree. A file that was never committed is not in
+        it, and no reviewer will ever see it."""
+        self.fx.branch("feature/SPEC-0007-thing")
+        self.fx.write("src/thing.py", "import json\n")
+        self.fx.write("tests/test_thing.py", "def test_f():\n    pass\n")
+        self.fx.commit("source with no spec and no handoff")
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC)        # deliberately NOT committed
+        self.fx.write("handoffs/HANDOFF-0007.md", GOOD_HANDOFF)     # deliberately NOT committed
+        rep = gate.run(self.fx.root, "ci", "main", None)
+        self.assertEqual(self.fx.result(rep, "G0")["status"], "fail",
+                         self.fx.result(rep, "G0")["evidence"])
+        self.assertEqual(self.fx.result(rep, "G5")["status"], "fail",
+                         self.fx.result(rep, "G5")["evidence"])
+
+    def test_a_committed_spec_and_handoff_still_pass_in_ci(self):
+        full_production_setup(self.fx)
+        self.fx.commit("a complete production change")
+        rep = gate.run(self.fx.root, "ci", "main", None)
+        self.assertTrue(rep["ok"], json.dumps(rep["results"], indent=1))
+
+    # --- an eval pass rate has to be a real number in range ---------------------------
+    def _eval_setup(self, rate):
+        full_production_setup(self.fx)
+        self.fx.write("prompts/p.txt", "you are a helpful assistant\n")
+        self.fx.write("evalrun.py", textwrap.dedent(f"""\
+            import json, pathlib
+            pathlib.Path('.agentic/evals').mkdir(parents=True, exist_ok=True)
+            pathlib.Path('.agentic/evals/result.json').write_text(json.dumps({{
+                "cases": 5, "overall_pass_rate": {rate}, "target": "real-thing",
+                "dimensions": {{"task_success": {{"rubric": "r", "pass_rate": 1.0}},
+                                "hallucination": {{"rubric": "r", "pass_rate": 1.0}}}}}}))
+            """))
+        toml = (self.fx.root / "agentic.toml").read_text(encoding="utf-8")
+        self.fx.write("agentic.toml", toml.replace('result_file = "result.json"',
+                                                   'result_file = ".agentic/evals/result.json"'))
+        return self.fx.result(self.fx.run(), "G3")
+
+    def test_g3_rejects_a_boolean_pass_rate(self):
+        """bool is a subclass of int, so `true` walked past the numeric check and then past
+        `overall < min_rate`, and was printed as 1.000."""
+        g3 = self._eval_setup("True")
+        self.assertEqual(g3["status"], "fail", g3["evidence"])
+
+    def test_g3_rejects_a_non_finite_pass_rate(self):
+        """NaN compares false against everything, including `< min_rate`."""
+        g3 = self._eval_setup("float('nan')")
+        self.assertEqual(g3["status"], "fail", g3["evidence"])
+
+    def test_g3_rejects_a_pass_rate_above_one(self):
+        g3 = self._eval_setup("1.5")
+        self.assertEqual(g3["status"], "fail", g3["evidence"])
+
+    def test_g3_accepts_a_real_pass_rate(self):
+        g3 = self._eval_setup("0.95")
+        self.assertEqual(g3["status"], "pass", g3["evidence"])
 
 
 if __name__ == "__main__":

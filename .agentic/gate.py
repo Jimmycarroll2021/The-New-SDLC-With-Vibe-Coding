@@ -165,27 +165,37 @@ class Repo:
         mb = self.git("merge-base", base, "HEAD").strip()
         return mb or None
 
-    def changed_files(self, base: str | None, staged: bool) -> tuple[list[str], str]:
-        """Returns (files, mode). mode explains how the set was derived, for the report."""
+    def changed_files(self, base: str | None, staged: bool, ci: bool = False) -> tuple[list[str], str]:
+        """Returns (files, mode). mode explains how the set was derived, for the report.
+
+        In CI the candidate is the proposed tree, so the set is the committed diff and nothing
+        else. Including the working tree there let an untracked spec or handoff - a file that is
+        not part of what is being proposed, and that no reviewer will ever see - satisfy G0 and
+        G5."""
         if staged:
             out = self.git("diff", "--cached", "--name-only", "--diff-filter=ACMR")
             return sorted(f for f in out.splitlines() if f.strip()), "staged"
         mb = self.merge_base(base)
         mode = "no base resolvable: whole tree"
         if mb:
-            out = self.git("diff", "--name-only", "--diff-filter=ACMR", mb)
-            untracked = self.git("ls-files", "--others", "--exclude-standard")
-            files = sorted(f for f in set(out.splitlines()) | set(untracked.splitlines()) if f.strip())
+            rng = f"{mb}..HEAD" if ci else mb
+            out = self.git("diff", "--name-only", "--diff-filter=ACMR", rng)
+            names = set(out.splitlines())
+            if not ci:
+                names |= set(self.git("ls-files", "--others", "--exclude-standard").splitlines())
+            files = sorted(f for f in names if f.strip())
             head = self.git("rev-parse", "HEAD").strip()
             if files or mb != head:
-                return files, f"diff vs merge-base {mb[:10]} ({base})"
+                return files, (f"committed diff {mb[:10]}..HEAD ({base})" if ci
+                               else f"diff vs merge-base {mb[:10]} ({base})")
             mode = f"clean tree on {base} itself: whole-tree audit"
-        tracked = self.git("ls-files")
-        untracked = self.git("ls-files", "--others", "--exclude-standard")
-        files = set(tracked.splitlines()) | set(untracked.splitlines())
+        files = set(self.git("ls-files").splitlines())
+        if not ci:
+            files |= set(self.git("ls-files", "--others", "--exclude-standard").splitlines())
         return sorted(f for f in files if f.strip()), mode
 
-    def added_lines(self, base: str | None, staged: bool, files: list[str]) -> dict[str, list[tuple[int, str]]]:
+    def added_lines(self, base: str | None, staged: bool, files: list[str],
+                    ci: bool = False) -> dict[str, list[tuple[int, str]]]:
         """file -> [(line_no, text)] of ADDED lines. Falls back to full content when no diff base."""
         args: list[str] | None = None
         if staged:
@@ -193,7 +203,8 @@ class Repo:
         else:
             mb = self.merge_base(base)
             if mb:
-                args = ["diff", "-U0", "--diff-filter=ACMR", mb]
+                # in CI the committed range, for the same reason the change set uses it
+                args = ["diff", "-U0", "--diff-filter=ACMR", f"{mb}..HEAD" if ci else mb]
         result: dict[str, list[tuple[int, str]]] = {}
         if args:
             cur, ln = None, 0
@@ -247,6 +258,12 @@ class Repo:
 
     def show(self, ref: str, path: str) -> str:
         return self.git("show", f"{ref}:{path}")
+
+    def tracked_at(self, ref: str) -> set[str]:
+        """Every path present in a committed tree, so a gate can tell the proposed tree from the
+        checkout it happens to be running in."""
+        out = self.git("ls-tree", "-r", "--name-only", ref)
+        return {f.strip() for f in out.splitlines() if f.strip()}
 
     def show_blob(self, ref: str, path: str) -> str | None:
         """The blob, or None when the path does not exist at that revision. `show` cannot tell an
@@ -337,7 +354,8 @@ class Ctx:
     @property
     def added(self) -> dict[str, list[tuple[int, str]]]:
         if self._added is None:
-            self._added = self.repo.added_lines(self.base, self.stage == "commit", self.changed)
+            self._added = self.repo.added_lines(self.base, self.stage == "commit", self.changed,
+                                                ci=self.stage == "ci")
         return self._added
 
     @property
@@ -447,14 +465,19 @@ def gate_g0_spec(ctx: Ctx) -> GateResult:
                      [f"reference a SPEC-NNNN in the branch name, a commit message, a changed handoff's Spec: field, or add/modify a file under {spec_dir}/",
                       f"template: .agentic/templates/SPEC.md"])
     evidence, problems = [], []
+    # in CI the proposed tree is the candidate: an untracked spec is not part of what is being
+    # proposed, and no reviewer of the pull request will ever see it
+    in_tree = ctx.repo.tracked_at("HEAD") if ctx.stage == "ci" else None
     for sid in sorted(ids):
-        matches = list((ctx.repo.root / spec_dir).glob(f"**/{sid}*.md"))
-        if not matches:
+        rels = [p.relative_to(ctx.repo.root).as_posix()
+                for p in (ctx.repo.root / spec_dir).glob(f"**/{sid}*.md")]
+        if in_tree is not None:
+            rels = [r for r in rels if r in in_tree]
+        if not rels:
             problems.append(f"{sid}: referenced but no file {spec_dir}/**/{sid}*.md")
             continue
-        for spec in matches:
-            rel = spec.relative_to(ctx.repo.root).as_posix()
-            probs, tier_word = spec_problems(ctx, rel, read_text(spec) or "")
+        for rel in rels:
+            probs, tier_word = spec_problems(ctx, rel, candidate_text(ctx, rel))
             problems.extend(probs)
             if not probs:
                 evidence.append(f"{rel}: sections ok, tier '{tier_word}' >= branch tier '{ctx.tier}'")
@@ -544,8 +567,13 @@ def gate_g3_evals(ctx: Ctx) -> GateResult:
     if cases < min_cases:
         problems.append(f"{cases} eval cases, minimum {min_cases}: a demo proves it can succeed once")
     overall = res.get("overall_pass_rate")
-    if not isinstance(overall, (int, float)):
+    # bool is a subclass of int, and NaN compares false against everything, so `true` and `NaN`
+    # both used to walk straight past `overall < min_rate` and be reported as a pass
+    if not isinstance(overall, (int, float)) or isinstance(overall, bool) \
+            or overall != overall or overall in (float("inf"), float("-inf")):
         problems.append("result has no numeric overall_pass_rate")
+    elif not 0.0 <= overall <= 1.0:
+        problems.append(f"overall_pass_rate {overall} is not a rate between 0 and 1")
     elif overall < min_rate:
         problems.append(f"overall_pass_rate {overall:.3f} < {min_rate:.2f}")
     else:
@@ -593,6 +621,12 @@ def declared_python_deps(root: Path, aliases: dict[str, str]) -> tuple[set[str],
 
     def req_name(line: str) -> str | None:
         raw = line.strip()
+        if raw.startswith("#"):
+            # a commented-out requirement declares nothing. The #egg= fragment belongs to a URL,
+            # and a URL never starts the line with a comment marker, so this cannot lose a real
+            # declaration - while without it, any installed package could be "declared" by a
+            # comment naming it.
+            return None
         egg = re.search(r"#egg=([A-Za-z0-9._-]+)", raw)     # a VCS or URL requirement names itself
         if egg:
             return norm(egg.group(1))
@@ -738,6 +772,9 @@ def python_env_note(ctx: Ctx, change_set: list[str]) -> tuple[str | None, str | 
     return None, None
 
 
+SCANNED_SUFFIXES = (".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+
+
 def python_module_exists(top: str, dotted: str = "") -> str | None:
     """None when the import resolves to real code, otherwise why it does not.
 
@@ -759,9 +796,18 @@ def python_module_exists(top: str, dotted: str = "") -> str | None:
         return ("is declared but resolves only to a directory holding no importable module: "
                 f"{[str(p) for p in locs[:2]]}")
     parts = dotted.split(".")[1:] if dotted else []
+    leaf = top if spec.submodule_search_locations is None else None
     for i, part in enumerate(parts):
         here = [d for d in locs if d.is_dir()]
         if not here:
+            # empty because the previous component is a module rather than a package is an
+            # observation, not a blind spot: a .py file holds no submodules. The exception is a
+            # module that publishes one itself, as os.py does for os.path, and sys.modules is
+            # where that is visible without importing anything.
+            child = ".".join([top] + parts[:i + 1])
+            if leaf and child not in sys.modules:
+                return (f"is declared, but '{leaf}' is a module and not a package, so "
+                        f"'{child}' cannot exist")
             return None                     # not observable on disk: do not guess
         nxt, found = [], False
         for d in here:
@@ -773,6 +819,8 @@ def python_module_exists(top: str, dotted: str = "") -> str | None:
                 found = True
         if not found:
             return f"is declared, but '{'.'.join([top] + parts[:i + 1])}' does not exist in it"
+        # a component that matched only as a file is where the walk has to stop next turn
+        leaf = None if nxt else ".".join([top] + parts[:i + 1])
         locs = nxt
     return None
 
@@ -802,8 +850,8 @@ def check_python_imports(ctx: Ctx, files: list[str]) -> tuple[list[str], list[st
         notes.append(f"import existence: applied - {refused}")
     problems = []
     for f in files:
-        text = read_text(ctx.repo.root / f)
-        if text is None:
+        text = ctx.integrity.texts.get(f)
+        if not text:
             continue
         try:
             tree = ast.parse(text)
@@ -837,6 +885,32 @@ def check_python_imports(ctx: Ctx, files: list[str]) -> tuple[list[str], list[st
     return problems, notes
 
 
+def js_exports_targets(node, out: list[str] | None = None) -> list[str]:
+    """Every relative target named anywhere in a package.json `exports` value.
+
+    `exports` nests arbitrarily - condition maps, subpath maps, and arrays of fallbacks - so the
+    targets are collected rather than resolved against Node's own algorithm."""
+    out = [] if out is None else out
+    if isinstance(node, str):
+        out.append(node)
+    elif isinstance(node, list):
+        for v in node:
+            js_exports_targets(v, out)
+    elif isinstance(node, dict):
+        for v in node.values():
+            js_exports_targets(v, out)
+    return out
+
+
+def js_target_is_file(pkg_dir: Path, target: str) -> bool:
+    rel = target[2:] if target.startswith("./") else target.lstrip("/")
+    if not rel:
+        return False
+    t = pkg_dir.joinpath(*rel.split("/"))
+    return (t.is_file() or (t / "index.js").is_file()
+            or any(t.with_name(t.name + s).is_file() for s in (".js", ".json", ".node", ".mjs", ".cjs")))
+
+
 def js_entry_ok(modules_dir: Path, name: str) -> bool:
     """Whether node_modules/<name> holds something Node could actually load. Filesystem only: no
     registry lookup and no `npm ls`."""
@@ -851,8 +925,17 @@ def js_entry_ok(modules_dir: Path, name: str) -> bool:
             data = json.loads(pj.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             data = {}
-        if data.get("exports") is not None:
-            return True
+        exports = data.get("exports")
+        if exports is not None:
+            # `exports` takes precedence over `main` for a bare specifier, so if it names only
+            # files that are absent, Node loads nothing and neither does the gate.
+            targets = [t for t in js_exports_targets(exports) if t.startswith(".")]
+            if any(js_target_is_file(d, t) for t in targets if "*" not in t):
+                return True
+            if any("*" in t for t in targets) or not targets:
+                return True     # a subpath pattern needs Node's own matcher: a walker that cannot
+                                # resolve it does not get to call a real package hollow
+            return False
         main = data.get("main")
         if isinstance(main, str) and main:
             t = d / main
@@ -909,8 +992,8 @@ def check_js_imports(ctx: Ctx, files: list[str]) -> tuple[list[str], list[str]]:
     spec_re = re.compile(r"""(?:\bimport\s+(?:[^'"]*?\s+from\s+)?|\brequire\s*\(\s*|\bimport\s*\(\s*)['"]([^'"]+)['"]""")
     problems = []
     for f in files:
-        text = read_text(ctx.repo.root / f)
-        if text is None:
+        text = ctx.integrity.texts.get(f)
+        if not text:
             continue
         for m in spec_re.finditer(text):
             spec = m.group(1)
@@ -969,7 +1052,10 @@ def gate_g5_handoff(ctx: Ctx) -> GateResult:
     problems, evidence = [], []
     spec_dir = ctx.cfg_get("paths", "specs", default="specs")
     for f in files:
-        text = read_text(ctx.repo.root / f) or ""
+        # the candidate snapshot, taken before G2 ran the branch's own test command: a test that
+        # fills in 'Verified: TBD' mid-run would otherwise complete a handoff that HEAD still
+        # carries as a placeholder
+        text = ctx.integrity.texts.get(f) or ""
         for name in required:
             val = field_value(text, name)
             if val is None or PLACEHOLDER.match(val):
@@ -1044,7 +1130,10 @@ def declaration_diff_paths(ctx: Ctx) -> set[str]:
 
     Touching a file is not declaring anything. Without this, a blank line added to a maintenance
     spec that landed a year ago hands today's change a standing permission."""
-    added = re.compile(rf"^\+\W*{re.escape(DECLARATION_FIELD)}\W*:", re.I)
+    # the VALUE on the added line, not merely the field name: field_value reads the first
+    # occurrence in the file, so a change that adds any line naming the field - a fenced example,
+    # a "no" further down - used to renew an affirmative declaration written above it long ago
+    added = re.compile(rf"^\+\W*{re.escape(DECLARATION_FIELD)}\W*:[ \t*_]*(.*?)\s*$", re.I)
     diffs = []
     if ctx.stage == "commit":
         diffs.append(ctx.repo.git("diff", "--cached", "-U0", "--diff-filter=ACMR"))
@@ -1057,8 +1146,10 @@ def declaration_diff_paths(ctx: Ctx) -> set[str]:
         if raw.startswith("+++ "):
             cur = raw[4:].removeprefix("b/").strip()
             cur = None if cur == "/dev/null" else cur
-        elif cur and added.match(raw):
-            out.add(cur)
+        elif cur:
+            m = added.match(raw)
+            if m and m.group(1).lower().strip("* ") in ("yes", "true"):
+                out.add(cur)
     return out
 
 
@@ -1132,6 +1223,7 @@ class Integrity:
     declared: str | None = None
     tier_floor: str | None = None
     python_env: tuple[str | None, str | None] = (None, None)
+    texts: dict[str, str] = field(default_factory=dict)
     problems: list[str] = field(default_factory=list)
     evidence: list[str] = field(default_factory=list)
 
@@ -1178,6 +1270,14 @@ def resolve_integrity(ctx: Ctx) -> Integrity:
     # that creates a virtualenv marker mid-run would otherwise turn every G4 existence failure into
     # not_applicable, which is the snapshot bug in a different gate
     out.python_env = python_env_note(ctx, out.change_set)
+    # and the content G4 scans, for the same reason again: G2 runs the branch's own test command,
+    # so a test that rewrites an offending source file between the commit and the read would turn
+    # a committed hallucinated import into a G4 pass while HEAD still carries it
+    hdir = ctx.cfg_get("paths", "handoffs", default="handoffs").rstrip("/") + "/"
+    for rel in ctx.changed:
+        if rel.endswith(SCANNED_SUFFIXES) or (rel.replace("\\", "/").startswith(hdir)
+                                              and rel.endswith(".md")):
+            out.texts[rel] = candidate_text(ctx, rel)
     return out
 
 
@@ -1232,6 +1332,24 @@ def load_config(root: Path) -> dict:
         return tomllib.loads(p.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as e:
         raise SystemExit(f"agentic.toml does not parse: {e}") from None
+
+
+def candidate_config(repo: Repo, root: Path, stage: str) -> dict:
+    """The candidate's own policy, read from the tree it is proposing rather than from disk.
+
+    In CI the proposed tree is HEAD and an uncommitted agentic.toml is not part of what is being
+    proposed. Reading it from the working tree meant that, once the committed diff had declared
+    framework maintenance, a dirty checkout chose the gate list - `[tiers.required] production = []`
+    on disk collapsed the run to G6 alone."""
+    if stage != "ci":
+        return load_config(root)
+    text = repo.show_blob("HEAD", "agentic.toml") or ""
+    if not text.strip():
+        return load_config(root)    # nothing committed to judge: the bootstrap case
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise SystemExit(f"agentic.toml on HEAD does not parse: {e}") from None
 
 
 def verdict(results) -> bool:
@@ -1295,7 +1413,7 @@ def resolve_base(repo: Repo, cfg: dict, stage: str, base: str | None) -> str | N
 def build_ctx(repo: Repo, cfg: dict, stage: str, base: str | None, tier_override: str | None) -> Ctx:
     branch = repo.branch()
     tier, tier_problem = resolve_tier(cfg, branch, tier_override)
-    changed, mode = repo.changed_files(base, stage == "commit")
+    changed, mode = repo.changed_files(base, stage == "commit", ci=stage == "ci")
     return Ctx(repo, cfg, stage, base, tier, branch, changed, mode,
                branch_tier=detect_tier(cfg, branch),
                committed=repo.committed_changed_files(base), tier_override_problem=tier_problem,
@@ -1342,17 +1460,22 @@ def resolve_policy(repo: Repo, cfg: dict, stage: str, base: str | None,
     # [tiers.branch_patterns] so its own branch reads as production would otherwise hand itself the
     # policy its declaration was rejected under
     if trial.integrity.declared and gate_g6_integrity(trial).status == "pass":
+        # the branch's tier under the policy in force, not under the one this change proposes.
+        # Recomputing it from the candidate rejected exactly the maintenance that moves a branch
+        # pattern: the base policy had already approved the edit as production work.
+        ctx.branch_tier = trial.branch_tier
         return ctx, f"candidate: framework maintenance declared in {trial.integrity.declared}"
     return trial, why
 
 
 def run(root: Path, stage: str, base: str | None, tier_override: str | None) -> dict:
-    cfg = load_config(root)
     repo = Repo(root)
+    cfg = candidate_config(repo, root, stage)
     base = resolve_base(repo, cfg, stage, base)
     ctx, policy = resolve_policy(repo, cfg, stage, base, tier_override)
     _ = ctx.integrity   # BEFORE any gate runs. G2 and G3 execute the branch's own commands, so what
                         # authorises a change to the judge may not be read from state it can write.
+    _ = ctx.added       # same reason: the secret scan diffs the working tree at local stage
     default = [g for g in GATES if g != "G6"]
     required = list(ctx.cfg.get("tiers", {}).get("required", {}).get(ctx.tier, default))
     if stage == "commit":
@@ -1418,10 +1541,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(json.dumps(rep, indent=2))
-        except BaseException:
+            os.replace(tmp, report)     # inside the guard: a failed rename leaks the temporary
+        except BaseException:           # file just as surely as a failed write does
             tmp.unlink(missing_ok=True)
             raise
-        os.replace(tmp, report)
     except OSError:
         pass
     if a.json:
