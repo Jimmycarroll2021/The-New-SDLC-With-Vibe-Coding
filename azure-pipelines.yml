@@ -1,0 +1,23 @@
+trigger:
+  branches:
+    include: [main, master, release/*]
+pr:
+  branches:
+    include: ["*"]
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - checkout: self
+    fetchDepth: 0
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: "3.11"
+  # Add dependency installs here if tests.command needs them
+  - script: python .agentic/gate.py --stage ci
+    displayName: agentic gates
+    # System.PullRequest.TargetBranch and SourceBranch are read automatically
+  - publish: .agentic/last-report.json
+    artifact: agentic-gate-report
+    condition: always()

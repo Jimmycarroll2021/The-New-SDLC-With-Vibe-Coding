@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.agentic/last-report.json
+.agentic/evals/result.json
+.agentic/runs/

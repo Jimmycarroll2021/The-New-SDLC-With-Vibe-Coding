@@ -1,0 +1,90 @@
+# agentic-gates configuration. Edit [paths] and [tests] for your repo; the rest has sane defaults.
+# Everything here is deterministic policy. Nothing in this file is read by a model.
+
+[project]
+name = "agentic-gates"
+base_branch = "main"          # what local runs diff against; CI overrides with the PR target
+
+# ---------------------------------------------------------------------------- risk tier
+# The paper's rule: position on the spectrum depends on the stakes. Tier is decided by the
+# branch name, first match wins, and the tier decides which gates apply. There is no skip flag.
+[tiers]
+default = "production"
+
+[tiers.branch_patterns]
+prototype  = ["proto/*", "spike/*", "sandbox/*", "scratch/*"]
+internal   = ["internal/*", "tooling/*", "docs/*"]
+production = ["main", "master", "release/*", "feature/*", "fix/*", "hotfix/*"]
+
+[tiers.required]
+prototype  = ["G4"]                                   # secrets never ship, even from a spike
+internal   = ["G1", "G2", "G4"]
+production = ["G0", "G1", "G2", "G3", "G4", "G5"]
+
+# Which gates the pre-commit hook runs (cheap, no test execution). CI and local run all required.
+[stages]
+commit = ["G1", "G4"]
+
+# ---------------------------------------------------------------------------- paths
+[paths]
+source     = [".agentic/gate.py", ".agentic/loop.py", ".agentic/evals/*.py"]
+tests      = ["tests/**"]
+ai_surface = ["AGENTS.md", ".agentic/evals/**", ".agentic/templates/**", "prompts/**", "agents/**"]
+specs      = "specs"
+handoffs   = "handoffs"
+
+# ---------------------------------------------------------------------------- G0 spec
+[spec]
+required_sections = ["Intent", "Acceptance criteria", "Out of scope", "Risk tier", "Verification"]
+
+# ---------------------------------------------------------------------------- G1 context
+[context]
+rule_file         = "AGENTS.md"
+required_sections = ["Stack", "Conventions", "Hard rules", "Workflow"]
+max_lines         = 120       # static context is paid on every turn; keep it dense
+
+# ---------------------------------------------------------------------------- G2 tests
+[tests]
+command            = "python -m unittest discover -s tests -q"
+require_test_touch = true     # a source change with no test change fails
+run_on_commit      = false    # pre-commit does the cheap gates; CI runs the suite
+timeout_seconds    = 900
+
+# ---------------------------------------------------------------------------- G3 evals
+# Only fires when the change touches paths.ai_surface. The command must write result_file in the
+# contract shape documented in .agentic/evals/README.md. The runner is yours; the contract is fixed.
+[evals]
+command             = "python .agentic/evals/example_runner.py"
+result_file         = ".agentic/evals/result.json"
+min_pass_rate       = 0.90
+min_cases           = 5
+required_dimensions = ["task_success", "tool_use", "trajectory", "hallucination", "response_quality"]
+allow_stub_target   = true    # TRUE ONLY IN THIS FRAMEWORK REPO. Set false in yours or G3 measures nothing.
+timeout_seconds     = 1800
+
+# ---------------------------------------------------------------------------- G4 review
+[review]
+check_hallucinated_imports = true
+exclude               = [".agentic/last-report.json", "*.lock", "package-lock.json"]
+extra_secret_patterns = []
+js_alias_prefixes     = ["@/", "~/", "#"]
+
+[review.import_aliases]
+# import name = distribution name, when they differ and are not in the built-in list
+# example: "mymod" = "my-distribution"
+
+# ---------------------------------------------------------------------------- G5 handoff
+[handoff]
+required_fields = ["Spec", "Agent", "Model", "Verified", "Not verified", "Reviewer"]
+
+# ---------------------------------------------------------------------------- orchestration loop
+# loop.py runs: agent -> gates -> (fail? feed report back to agent) ... up to max_iterations.
+# The agent is any CLI that takes a prompt. Use {prompt_file} to pass a path, otherwise the prompt
+# is piped to stdin. Examples (pick one, or your own):
+#   "claude -p --permission-mode acceptEdits"
+#   "codex exec --full-auto -"
+#   "gemini -p -"
+[loop]
+agent_command  = "claude -p --permission-mode acceptEdits"
+max_iterations = 4
+runs_dir       = ".agentic/runs"

@@ -1,0 +1,15 @@
+{
+  "_comment": "Optional Claude Code adapter. Merge into .claude/settings.json in your repo. The Stop hook makes the agent unable to declare itself finished while a gate fails: exit 2 blocks the stop and feeds stderr back to the model. This is the harness remembering what the model forgets.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .agentic/gate.py --stage local > .agentic/stop-hook.out 2>&1 || (cat .agentic/stop-hook.out 1>&2; exit 2)"
+          }
+        ]
+      }
+    ]
+  }
+}

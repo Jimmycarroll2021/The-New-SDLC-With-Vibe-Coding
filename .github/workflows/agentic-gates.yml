@@ -1,0 +1,28 @@
+name: agentic-gates
+
+on:
+  pull_request:
+  push:
+    branches: [main, master, "release/**"]
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # the gates diff against the PR target, so history is needed
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Add your own dependency install here if tests.command needs it (pip install -r requirements.txt, npm ci ...)
+      - name: Run gates
+        run: python .agentic/gate.py --stage ci
+        # GITHUB_BASE_REF / GITHUB_HEAD_REF are read automatically; on push, main is compared to itself
+        # and only the tree-wide checks (G1, G2 run, G4 on untracked) are meaningful.
+      - name: Upload gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentic-gate-report
+          path: .agentic/last-report.json

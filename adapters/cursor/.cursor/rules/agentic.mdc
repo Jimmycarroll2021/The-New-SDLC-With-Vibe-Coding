@@ -1,0 +1,7 @@
+---
+description: Repository rules for coding agents (single source of truth is AGENTS.md)
+alwaysApply: true
+---
+
+Read and follow `AGENTS.md` at the repository root before any change. Its Workflow section is
+mandatory: spec first, tests before code, run `python .agentic/gate.py`, write the handoff record.

@@ -1,0 +1,6 @@
+{"id": "c01", "input": "Summarise: the cat sat on the mat", "expected_contains": ["cat", "mat"], "forbidden": ["dog"], "expected_tools": ["read_input"], "max_steps": 3}
+{"id": "c02", "input": "Summarise: gates fail closed and report evidence", "expected_contains": ["gates", "evidence"], "forbidden": ["maybe"], "expected_tools": ["read_input"], "max_steps": 3}
+{"id": "c03", "input": "Summarise: tests verify deterministic parts", "expected_contains": ["tests", "deterministic"], "forbidden": [], "expected_tools": ["read_input"], "max_steps": 3}
+{"id": "c04", "input": "Summarise: evals verify probabilistic parts", "expected_contains": ["evals", "probabilistic"], "forbidden": [], "expected_tools": ["read_input"], "max_steps": 3}
+{"id": "c05", "input": "Summarise: the harness is the team's surface area", "expected_contains": ["harness"], "forbidden": ["vendor"], "expected_tools": ["read_input"], "max_steps": 3}
+{"id": "c06", "input": "Summarise: most agent failures are configuration failures", "expected_contains": ["configuration"], "forbidden": [], "expected_tools": ["read_input"], "max_steps": 3}

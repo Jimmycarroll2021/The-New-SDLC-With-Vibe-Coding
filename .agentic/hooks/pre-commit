@@ -1,0 +1,4 @@
+#!/bin/sh
+# agentic-gates pre-commit: cheap deterministic gates on the staged diff (G1, G4 by default).
+# Installed by: python .agentic/hooks/install_hooks.py
+exec python .agentic/gate.py --stage commit
