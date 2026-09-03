@@ -125,7 +125,7 @@ AGENTS.md  CLAUDE.md  GEMINI.md  rules, and two one-line pointers to them
 specs/  handoffs/                one file per change, checked by G0 and G5
 docs/GATES.md                    what each gate checks and why
 adapters/                        optional per-tool conveniences
-tests/test_gate.py               24 tests; each builds a real temporary git repo
+tests/test_gate.py               25 tests; each builds a real temporary git repo
 ```
 
 ## What it deliberately does not do

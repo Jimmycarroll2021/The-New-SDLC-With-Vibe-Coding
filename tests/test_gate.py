@@ -235,6 +235,14 @@ class EndToEnd(unittest.TestCase):
         rep = self.fx.run()
         self.assertEqual(self.fx.result(rep, "G0")["status"], "pass")
 
+    def test_g0_accepts_spec_reference_from_changed_handoff(self):
+        self.fx.branch("feature/no-id-here")
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC)
+        self.fx.commit("spec landed earlier, message says nothing useful")
+        self.fx.write("handoffs/HANDOFF-0007.md", GOOD_HANDOFF)        # Spec: SPEC-0007 inside
+        rep = self.fx.run()
+        self.assertEqual(self.fx.result(rep, "G0")["status"], "pass", self.fx.result(rep, "G0")["evidence"])
+
     # ---- G1
     def test_g1_fails_on_missing_section_and_length(self):
         full_production_setup(self.fx)
