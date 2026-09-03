@@ -122,7 +122,17 @@ class RepoFixture:
         self.write("AGENTS.md", GOOD_AGENTS)
         self.write("README.md", "hello\n")
         self.write(".agentic/gate.py", "# stand-in for the runner, so G6 has something to protect\n")
-        self.write(".github/workflows/gates.yml", "run: python .agentic/gate.py --stage ci\n")
+        self.write(".github/workflows/gates.yml", textwrap.dedent("""\
+            jobs:
+              gates:
+                steps:
+                  - uses: actions/setup-python@v5
+                    with:
+                      python-version: "3.11"
+                  - run: |
+                      BASE_SHA="$PR_BASE_SHA"
+                      python .agentic/gate.py --root . --stage ci --base "$BASE_SHA"
+            """))
         git(self.root, "add", "-A")
         git(self.root, "commit", "-q", "-m", "init")
 
@@ -499,13 +509,6 @@ class Integrity(unittest.TestCase):
         g6 = self.fx.result(self.fx.run(), "G6")
         self.assertEqual(g6["status"], "fail", g6["evidence"])
 
-    def test_g6_ignores_an_unrelated_edit_to_a_gate_bearing_ci_file(self):
-        full_production_setup(self.fx)
-        self.fx.write(".github/workflows/gates.yml",
-                      "python-version: 3.12\nrun: python .agentic/gate.py --stage ci\n")
-        g6 = self.fx.result(self.fx.run(), "G6")
-        self.assertEqual(g6["status"], "pass", g6["evidence"])
-
     def test_g6_protects_the_ci_definition_at_commit_stage_too(self):
         self.fx.branch("feature/SPEC-0007-ci")
         self.fx.write(".github/workflows/gates.yml", "run: exit 0\n")
@@ -601,6 +604,162 @@ class Integrity(unittest.TestCase):
         rep = json.loads(p.stdout)
         self.assertFalse(rep["ok"])
         self.assertIn("integrity_error", rep)
+
+
+    # ---- authorisation must come from an immutable snapshot, resolved before branch code runs
+
+    def test_g6_protects_a_ci_file_beyond_the_lines_that_name_the_runner(self):
+        """P0: swapping the base revision the workflow trusts, while every line containing
+        gate.py stays byte-identical, used to read as an ordinary CI edit."""
+        full_production_setup(self.fx)
+        wf = (self.fx.root / ".github/workflows/gates.yml").read_text(encoding="utf-8")
+        tampered = wf.replace('BASE_SHA="$PR_BASE_SHA"', 'BASE_SHA="$(git rev-parse HEAD)"')
+        self.assertNotEqual(wf, tampered)
+        self.assertEqual([l for l in wf.splitlines() if "gate.py" in l],
+                         [l for l in tampered.splitlines() if "gate.py" in l],
+                         "the exploit is that no line naming gate.py changes")
+        self.fx.write(".github/workflows/gates.yml", tampered)
+        g6 = self.fx.result(self.fx.run(), "G6")
+        self.assertEqual(g6["status"], "fail")
+        self.assertTrue(any("gates.yml" in e for e in g6["evidence"]), g6["evidence"])
+
+    def test_g6_protects_every_line_of_a_ci_file_that_runs_the_gate(self):
+        """The consequence of the above, stated as its own case: there is no longer an unrelated
+        edit to a gate-bearing CI definition. A version bump in that file is declared like any
+        other change to the judge."""
+        full_production_setup(self.fx)
+        wf = (self.fx.root / ".github/workflows/gates.yml").read_text(encoding="utf-8")
+        self.fx.write(".github/workflows/gates.yml", wf.replace('"3.11"', '"3.12"'))
+        g6 = self.fx.result(self.fx.run(), "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+
+    def test_g6_reads_the_declaration_from_the_index_at_commit_stage(self):
+        """P0: the hook judges what is about to be committed. Declaring maintenance only in the
+        unstaged copy used to authorise a commit whose index carried no declaration."""
+        self.fx.branch("feature/SPEC-0007-thing")
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC)
+        self.fx.write(".agentic/gate.py", "# stand-in\n# tampered\n")
+        self.fx.stage("specs/SPEC-0007-thing.md", ".agentic/gate.py")
+        declared = GOOD_SPEC.replace("Risk tier: production",
+                                     "Risk tier: production\nFramework maintenance: yes", 1)
+        self.fx.write("specs/SPEC-0007-thing.md", declared)       # working tree only
+        g6 = self.fx.result(self.fx.run(stage="commit"), "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+        self.fx.stage("specs/SPEC-0007-thing.md")                 # now it is really being committed
+        g6 = self.fx.result(self.fx.run(stage="commit"), "G6")
+        self.assertEqual(g6["status"], "pass", g6["evidence"])
+
+    def test_g6_will_not_take_a_declaration_the_test_run_wrote(self):
+        """P0: G2 executes the branch's own test command, so anything G6 read from the filesystem
+        afterwards would be state the change had the chance to write."""
+        full_production_setup(self.fx)
+        self.fx.write("mutate.py", textwrap.dedent("""\
+            import pathlib
+            p = pathlib.Path('specs/SPEC-0007-thing.md')
+            p.write_text(p.read_text(encoding='utf-8') + 'Framework maintenance: yes\\n', encoding='utf-8')
+            """))
+        toml = (self.fx.root / "agentic.toml").read_text(encoding="utf-8")
+        self.fx.write("agentic.toml", "\n".join(
+            'command = "python mutate.py"' if l.startswith('command = "python -c') else l
+            for l in toml.splitlines()) + "\n")
+        self.fx.write(".agentic/gate.py", "# stand-in\n# tampered\n")
+        rep = self.fx.run()
+        self.assertIn("Framework maintenance: yes",
+                      (self.fx.root / "specs/SPEC-0007-thing.md").read_text(encoding="utf-8"),
+                      "the test command did not run, so this proves nothing")
+        g6 = self.fx.result(rep, "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+
+    def test_g6_will_not_renew_an_old_declaration_with_a_cosmetic_edit(self):
+        """P0: the declaration itself has to be in the diff. Touching the file around one that
+        landed a year ago is not a new declaration."""
+        self.fx.write("specs/SPEC-0007-thing.md", GOOD_SPEC.replace(
+            "Risk tier: production", "Risk tier: production\nFramework maintenance: yes", 1))
+        self.fx.commit("the maintenance declaration landed in an earlier change")
+        self.fx.branch("feature/SPEC-0007-more")
+        old = (self.fx.root / "specs/SPEC-0007-thing.md").read_text(encoding="utf-8")
+        self.fx.write("specs/SPEC-0007-thing.md", old + "\nA typo fixed much later.\n")
+        self.fx.write(".agentic/gate.py", "# stand-in\n# tampered again\n")
+        g6 = self.fx.result(self.fx.run(), "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+        self.assertTrue(any("neither adds" in e for e in g6["evidence"]), g6["evidence"])
+
+    def test_g6_will_not_take_a_declaration_from_an_unreferenced_permit_file(self):
+        """P0: a one-line specs/permit.md that G0 never looked at authorises nothing."""
+        full_production_setup(self.fx)
+        self.fx.write("specs/permit.md", "Framework maintenance: yes\n")
+        self.fx.write(".agentic/gate.py", "# stand-in\n# tampered\n")
+        rep = self.fx.run()
+        self.assertEqual(self.fx.result(rep, "G0")["status"], "pass")
+        g6 = self.fx.result(rep, "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+        self.assertTrue(any("permit.md" in e and "does not reference it" in e for e in g6["evidence"]),
+                        g6["evidence"])
+
+    def test_g6_will_not_take_a_declaration_from_a_spec_that_fails_g0(self):
+        full_production_setup(self.fx)
+        self.fx.write("specs/SPEC-0007-thing.md",
+                      "# SPEC-0007\nRisk tier: production\nFramework maintenance: yes\n## Intent\nx\n")
+        self.fx.write(".agentic/gate.py", "# stand-in\n# tampered\n")
+        rep = self.fx.run()
+        self.assertEqual(self.fx.result(rep, "G0")["status"], "fail")
+        g6 = self.fx.result(rep, "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+        self.assertTrue(any("does not satisfy G0" in e for e in g6["evidence"]), g6["evidence"])
+
+    def test_g6_refuses_a_base_that_is_the_candidates_own_tip(self):
+        """P1: --base HEAD empties the diff and used to select the vacuous whole-tree mode, which
+        is a skip flag by another name."""
+        full_production_setup(self.fx)
+        self.fx.write(".agentic/gate.py", "# stand-in\n# tampered\n")
+        self.fx.commit("edit the runner, then judge it against my own tip")
+        g6 = self.fx.result(gate.run(self.fx.root, "local", "HEAD", None), "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+        self.assertTrue(any("own tip" in e for e in g6["evidence"]), g6["evidence"])
+
+    def test_g6_still_sees_a_deletion_in_a_whole_tree_audit(self):
+        """P1: whole-tree mode used to empty the change set outright, discarding deletions that
+        vanished_files() had already caught."""
+        os.remove(self.fx.root / ".agentic/gate.py")      # on main, otherwise clean
+        rep = self.fx.run()
+        self.assertIn("whole-tree audit", rep["changed_mode"])
+        g6 = self.fx.result(rep, "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+        self.assertTrue(any(".agentic/gate.py" in e for e in g6["evidence"]), g6["evidence"])
+
+    def test_g6_passes_a_clean_whole_tree_audit_on_the_base_branch(self):
+        g6 = self.fx.result(self.fx.run(), "G6")
+        self.assertEqual(g6["status"], "pass", g6["evidence"])
+        self.assertTrue(any("nothing to diff" in e for e in g6["evidence"]), g6["evidence"])
+
+    def test_g6_treats_a_symlinked_runtime_artefact_as_protected(self):
+        """P1: .agentic/last-report.json -> ../agentic.toml is not an artefact. It turns the
+        runner's own report write into an overwrite of the policy."""
+        self.fx.branch("feature/SPEC-0007-thing")
+        blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=self.fx.root,
+                              input="../agentic.toml", capture_output=True, text=True,
+                              encoding="utf-8")
+        sha = blob.stdout.strip()
+        self.assertTrue(sha, blob.stderr)
+        git(self.fx.root, "update-index", "--add", "--cacheinfo",
+            f"120000,{sha},.agentic/last-report.json")
+        g6 = self.fx.result(self.fx.run(stage="commit"), "G6")
+        self.assertEqual(g6["status"], "fail", g6["evidence"])
+        self.assertTrue(any("last-report.json" in e for e in g6["evidence"]), g6["evidence"])
+
+    def test_the_report_write_does_not_follow_a_symlink(self):
+        full_production_setup(self.fx)
+        victim = self.fx.root / "agentic.toml"
+        link = self.fx.root / ".agentic/last-report.json"
+        try:
+            os.symlink(victim, link)
+        except (OSError, NotImplementedError, AttributeError) as e:
+            self.skipTest(f"this host does not permit creating symlinks: {e}")
+        before = victim.read_text(encoding="utf-8")
+        subprocess.run([sys.executable, str(ROOT / ".agentic/gate.py"), "--root", str(self.fx.root),
+                        "--base", "main"], capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(victim.read_text(encoding="utf-8"), before,
+                         "the report was written through the symlink, into the policy")
 
 
 class Loop(unittest.TestCase):

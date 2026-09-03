@@ -52,6 +52,8 @@ PROTECTED_CI = [".github/workflows/**", ".gitlab-ci.yml", ".circleci/config.yml"
                 "azure-pipelines.yml", "Jenkinsfile"]
 PROTECTED_RUNTIME = [".agentic/last-report.json", ".agentic/runs/**", ".agentic/evals/result.json",
                      "**/__pycache__/**", "*.pyc"]
+# The field a spec carries to authorise a deliberate change to the policy or the runner.
+DECLARATION_FIELD = "Framework maintenance"
 PLACEHOLDER = re.compile(r"^\s*(<[^>]*>|TBD|TODO|\.\.\.|n/?a)?\s*$", re.I)
 
 # import name -> distribution name, for packages whose two names differ
@@ -268,14 +270,23 @@ def match_any(path: str, globs: list[str]) -> bool:
     return False
 
 
-def is_protected(path: str) -> bool:
+def is_protected(path: str, regular: bool = True) -> bool:
     """True for the policy and the runner, false for the artefacts they write at run time.
-    Case-folded: on a case-insensitive filesystem Agentic.toml is the same file."""
+    Case-folded: on a case-insensitive filesystem Agentic.toml is the same file.
+
+    The run-time exemption is for regular files and directories only. A symlink or a gitlink at an
+    exempt path is not an artefact, it is a write-through: `.agentic/last-report.json` pointing at
+    `../agentic.toml` turns the runner's own report write into an overwrite of the policy."""
     p = path.replace("\\", "/").lower()
-    if match_any(p, PROTECTED_RUNTIME):
+    if regular and match_any(p, PROTECTED_RUNTIME):
         return False
     return (p in PROTECTED_FILES or p.startswith(PROTECTED_DIRS)
             or p in tuple(d.rstrip("/") for d in PROTECTED_DIRS))
+
+
+def norm_eol(text: str) -> str:
+    """git stores LF; a working tree on Windows may hold CRLF. Compare content, not line endings."""
+    return text.replace("\r\n", "\n")
 
 
 # ----------------------------------------------------------------------------- context
@@ -295,6 +306,7 @@ class Ctx:
     merge_base: str | None = None
     tier_override_problem: str | None = None
     _added: dict | None = None
+    _integrity: "Integrity | None" = None
 
     def cfg_get(self, *keys, default=None):
         node = self.cfg
@@ -309,6 +321,14 @@ class Ctx:
         if self._added is None:
             self._added = self.repo.added_lines(self.base, self.stage == "commit", self.changed)
         return self._added
+
+    @property
+    def integrity(self) -> Integrity:
+        """What G6 judges, resolved once. run() forces it before any gate executes: see
+        resolve_integrity for why that ordering is the whole fix."""
+        if self._integrity is None:
+            self._integrity = resolve_integrity(self)
+        return self._integrity
 
 
 def detect_tier(cfg: dict, branch: str) -> str:
@@ -378,25 +398,30 @@ def referenced_spec_ids(ctx: Ctx) -> set[str]:
     return ids
 
 
-def maintenance_spec(ctx: Ctx) -> str | None:
-    """The spec THIS change adds or modifies that declares it framework maintenance.
-
-    A spec merged earlier does not authorise a later change: the declaration has to be in the
-    diff under review, or it is not a declaration, it is a standing permission."""
-    spec_dir = ctx.cfg_get("paths", "specs", default="specs").rstrip("/") + "/"
-    changed = {f.replace("\\", "/") for f in list(ctx.changed) + list(ctx.committed)}
-    for rel in sorted(changed):
-        if not rel.startswith(spec_dir) or not rel.endswith(".md"):
-            continue
-        val = (field_value(read_text(ctx.repo.root / rel) or "", "Framework maintenance") or "")
-        if val.lower().strip("* ") in ("yes", "true"):   # a boolean, not a sentence to interpret
-            return rel
-    return None
+def spec_problems(ctx: Ctx, rel: str, text: str) -> tuple[list[str], str | None]:
+    """G0's checks on one spec, as a function of its text, so that G6 can hold the spec claiming to
+    authorise a change to the runner to exactly the bar G0 holds every other spec to."""
+    required = [s.lower() for s in ctx.cfg_get("spec", "required_sections", default=[])]
+    problems = []
+    hs = headings(text)
+    missing = [s for s in required if not any(h == s or h.startswith(s) for h in hs)]
+    if missing:
+        problems.append(f"{rel}: missing sections {missing}")
+    tier_val = (field_value(text, "Risk tier") or "").lower().strip("* ")
+    tier_word = next((t for t in TIER_RANK if t in tier_val), None)
+    if tier_word is None:
+        problems.append(f"{rel}: 'Risk tier:' must be one of {list(TIER_RANK)}, got {tier_val!r}")
+    elif TIER_RANK[tier_word] < TIER_RANK.get(ctx.tier, 2):
+        problems.append(f"{rel}: declares tier '{tier_word}' but branch '{ctx.branch}' is '{ctx.tier}'. "
+                        f"Move the work to a {tier_word} branch or raise the spec's tier.")
+    placeholders = re.findall(r"<[a-z][^>\n]{2,60}>", text)
+    if placeholders:
+        problems.append(f"{rel}: unfilled placeholders {placeholders[:4]}")
+    return problems, tier_word
 
 
 def gate_g0_spec(ctx: Ctx) -> GateResult:
     spec_dir = ctx.cfg_get("paths", "specs", default="specs")
-    required = [s.lower() for s in ctx.cfg_get("spec", "required_sections", default=[])]
     ids = referenced_spec_ids(ctx)
     if not ids:
         return _fail("G0", "no spec referenced",
@@ -410,22 +435,9 @@ def gate_g0_spec(ctx: Ctx) -> GateResult:
             continue
         for spec in matches:
             rel = spec.relative_to(ctx.repo.root).as_posix()
-            text = read_text(spec) or ""
-            hs = headings(text)
-            missing = [s for s in required if not any(h == s or h.startswith(s) for h in hs)]
-            if missing:
-                problems.append(f"{rel}: missing sections {missing}")
-            tier_val = (field_value(text, "Risk tier") or "").lower().strip("* ")
-            tier_word = next((t for t in TIER_RANK if t in tier_val), None)
-            if tier_word is None:
-                problems.append(f"{rel}: 'Risk tier:' must be one of {list(TIER_RANK)}, got {tier_val!r}")
-            elif TIER_RANK[tier_word] < TIER_RANK.get(ctx.tier, 2):
-                problems.append(f"{rel}: declares tier '{tier_word}' but branch '{ctx.branch}' is '{ctx.tier}'. "
-                                f"Move the work to a {tier_word} branch or raise the spec's tier.")
-            placeholders = re.findall(r"<[a-z][^>\n]{2,60}>", text)
-            if placeholders:
-                problems.append(f"{rel}: unfilled placeholders {placeholders[:4]}")
-            if not problems or all(rel not in p for p in problems):
+            probs, tier_word = spec_problems(ctx, rel, read_text(spec) or "")
+            problems.extend(probs)
+            if not probs:
                 evidence.append(f"{rel}: sections ok, tier '{tier_word}' >= branch tier '{ctx.tier}'")
     if problems:
         return _fail("G0", "spec incomplete or mismatched", problems)
@@ -733,26 +745,180 @@ def gate_g5_handoff(ctx: Ctx) -> GateResult:
     return _pass("G5", evidence)
 
 
-def gate_invocation_lines(text: str) -> list[str]:
-    return [line.strip() for line in text.splitlines() if "gate.py" in line]
+def candidate_text(ctx: Ctx, rel: str) -> str:
+    """The candidate's content for a path, from the most immutable source the stage offers.
+
+    At commit stage that is the index: the hook judges what is about to be committed, not whatever
+    the working tree happens to say when it looks. In CI it is the proposed tree, which nothing the
+    branch runs can rewrite. Locally the working tree IS the candidate, and the protection there is
+    that this is read before any gate executes."""
+    if ctx.stage == "commit":
+        return ctx.repo.git("show", f":{rel}")
+    if ctx.stage == "ci":
+        blob = ctx.repo.git("show", f"HEAD:{rel}")
+        if blob:
+            return blob
+    return read_text(ctx.repo.root / rel) or ""
 
 
 def ci_files_running_the_gate(ctx: Ctx, files: list[str]) -> list[str]:
-    """CI definitions whose invocation of the runner this change alters.
+    """CI definitions that invoked the runner on the base ref and are not identical here.
 
-    A definition that invokes the runner decides whether the gates run at all, so changing that
-    decision is a change to the judge. Bumping a Python version or an action version in the same
-    file is not, and failing those would train people to declare maintenance for everything."""
+    The whole file counts, not only the lines that name gate.py. The revision the workflow picks as
+    the base, the depth it checks out, the directory it unpacks the trusted runner into, an
+    enclosing `if:`, an injected PYTHONPATH, a `continue-on-error: true` and a bare `exit 0` before
+    the call all decide what the judge is and whether it runs, and not one of them mentions
+    gate.py. A definition that never ran the gate is an ordinary CI file and is not protected."""
     ref = ctx.merge_base or "HEAD"
     out = []
     for f in files:
         if not match_any(f, PROTECTED_CI):
             continue
-        before = gate_invocation_lines(ctx.repo.show(ref, f))
-        if not before:
+        before = ctx.repo.show(ref, f)
+        if "gate.py" not in before:
             continue                    # it did not run the gate, so this is an ordinary CI change
-        if before != gate_invocation_lines(read_text(ctx.repo.root / f) or ""):
+        if norm_eol(before) != norm_eol(candidate_text(ctx, f)):
             out.append(f)
+    return out
+
+
+def non_regular_paths(ctx: Ctx) -> set[str]:
+    """Paths the candidate records as something other than a regular file or directory: symlinks
+    (mode 120000) and gitlinks (160000) in the index, and symlinks in the working tree."""
+    out = set()
+    for line in ctx.repo.git("ls-files", "-s").splitlines():
+        mode, _, rest = line.partition(" ")
+        if mode in ("120000", "160000"):
+            out.add(rest.split("\t", 1)[-1].strip().replace("\\", "/"))
+    for f in ctx.changed:
+        try:
+            if (ctx.repo.root / f).is_symlink():
+                out.add(f.replace("\\", "/"))
+        except OSError:
+            pass
+    return out
+
+
+def declaration_diff_paths(ctx: Ctx) -> set[str]:
+    """Paths where THIS change introduces or rewrites the declaration line itself.
+
+    Touching a file is not declaring anything. Without this, a blank line added to a maintenance
+    spec that landed a year ago hands today's change a standing permission."""
+    added = re.compile(rf"^\+\W*{re.escape(DECLARATION_FIELD)}\W*:", re.I)
+    diffs = []
+    if ctx.stage == "commit":
+        diffs.append(ctx.repo.git("diff", "--cached", "-U0", "--diff-filter=ACMR"))
+    elif ctx.merge_base:
+        diffs.append(ctx.repo.git("diff", "-U0", "--diff-filter=ACMR", ctx.merge_base))
+        diffs.append(ctx.repo.git("diff", "-U0", "--diff-filter=ACMR", f"{ctx.merge_base}..HEAD"))
+    out, cur = set(), None
+    for raw in (line for d in diffs for line in d.splitlines()):
+        if raw.startswith("+++ "):
+            cur = raw[4:].removeprefix("b/").strip()
+            cur = None if cur == "/dev/null" else cur
+        elif cur and added.match(raw):
+            out.add(cur)
+    return out
+
+
+def resolve_declaration(ctx: Ctx) -> tuple[str | None, list[str]]:
+    """The spec THIS change relies on to authorise an edit to the policy or the runner.
+
+    Three conditions, each of them necessary. The file has to be the spec the change references, so
+    that G0 validated the same document the human is being asked to read. It has to satisfy G0 on
+    its own content, so that a one-line permit file authorises nothing. And the declaration itself
+    has to appear in this change's diff, so that an old yes in a file the change happens to touch
+    is not a standing permission."""
+    spec_dir = ctx.cfg_get("paths", "specs", default="specs").rstrip("/") + "/"
+    ids = referenced_spec_ids(ctx)
+    in_diff = declaration_diff_paths(ctx)
+    untracked = {f.strip().replace("\\", "/")
+                 for f in ctx.repo.git("ls-files", "--others", "--exclude-standard").splitlines()
+                 if f.strip()}
+    notes: list[str] = []
+    changed = {f.replace("\\", "/") for f in list(ctx.changed) + list(ctx.committed)}
+    for rel in sorted(changed):
+        if not rel.startswith(spec_dir) or not rel.endswith(".md"):
+            continue
+        text = candidate_text(ctx, rel)
+        val = (field_value(text, DECLARATION_FIELD) or "").lower().strip("* ")
+        if val not in ("yes", "true"):      # a boolean, not a sentence to interpret
+            continue
+        sid = re.search(r"SPEC-\d{3,}", rel)
+        if not sid or sid.group(0) not in ids:
+            notes.append(f"{rel}: declares framework maintenance, but this change does not reference it as "
+                         "its spec, so G0 never validated it. The authorising file has to be the spec the "
+                         "change is working to.")
+            continue
+        probs, _ = spec_problems(ctx, rel, text)
+        if probs:
+            notes.append(f"{rel}: declares framework maintenance but does not satisfy G0 itself: {probs[:2]}")
+            continue
+        if rel not in in_diff and rel not in untracked:
+            notes.append(f"{rel}: carries a '{DECLARATION_FIELD}' declaration that this change neither adds "
+                         "nor alters. Editing the file around an older declaration does not renew it.")
+            continue
+        return rel, notes
+    return None, notes
+
+
+def base_is_the_project_base(ctx: Ctx) -> bool:
+    """Whether a base ref that resolves to HEAD is the honest case: a clean tree sitting on the
+    project's own base branch. Anywhere else a base equal to the candidate's tip was chosen by the
+    candidate, and an empty diff is a skip flag by another name."""
+    configured = str(ctx.cfg_get("project", "base_branch", default="main"))
+    names = {configured, configured.removeprefix("origin/"), f"origin/{configured}"}
+    return ctx.branch in names and (ctx.base or "") in names
+
+
+@dataclass
+class Integrity:
+    """What G6 judges, resolved from the candidate snapshot BEFORE any gate runs.
+
+    G2 and G3 execute the branch's own test and eval commands. Anything G6 read from the live
+    filesystem after them would be state the candidate has had the opportunity to write: a
+    discovered test that appends a maintenance declaration to a spec during G2 would authorise the
+    very runner edit G6 exists to catch. So the change set, the protected paths and the authorising
+    declaration are resolved up front, from the index at commit stage and from the proposed tree
+    in CI."""
+    change_set: list[str] = field(default_factory=list)
+    protected: list[str] = field(default_factory=list)
+    source: list[str] = field(default_factory=list)
+    declared: str | None = None
+    problems: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)
+
+
+def resolve_integrity(ctx: Ctx) -> Integrity:
+    out = Integrity()
+    if ctx.stage == "commit":
+        out.change_set = sorted(set(ctx.changed) | set(ctx.vanished))
+    elif ctx.merge_base is None:
+        out.problems.append("no base ref resolvable: with no change set, neither the policy, the runner "
+                            "nor the tier can be checked against the diff. Fetch the base branch, or pass --base.")
+    elif "whole-tree audit" in ctx.changed_mode:
+        head = ctx.repo.git("rev-parse", "HEAD").strip()
+        if base_is_the_project_base(ctx):
+            out.evidence.append(f"clean tree on {ctx.base} itself: the policy, runner and tier checks have "
+                                "nothing to diff, so only deletions are visible")
+        else:
+            out.problems.append(f"base '{ctx.base}' resolves to this branch's own tip {head[:10]}, so the diff "
+                                "is empty and the policy, runner and tier checks can see nothing. Diff against "
+                                f"'{ctx.cfg_get('project', 'base_branch', default='main')}' instead: a base the "
+                                "change picks for itself is a skip flag.")
+        # a deletion never reaches --diff-filter=ACMR, so it is not covered by that empty diff
+        out.change_set = sorted(set(ctx.vanished))
+    else:
+        out.change_set = sorted(set(ctx.changed) | set(ctx.committed) | set(ctx.vanished))
+    non_regular = non_regular_paths(ctx)
+    out.protected = sorted(set(f for f in out.change_set
+                               if is_protected(f, regular=f.replace("\\", "/") not in non_regular))
+                           | set(ci_files_running_the_gate(ctx, out.change_set)))
+    out.source = [f for f in out.change_set
+                  if match_any(f, ctx.cfg_get("paths", "source", default=[]))]
+    if out.protected:
+        out.declared, notes = resolve_declaration(ctx)
+        out.evidence.extend(notes)
     return out
 
 
@@ -760,46 +926,33 @@ def gate_g6_integrity(ctx: Ctx) -> GateResult:
     """The change may not set the rules it is judged by, nor understate its own risk tier.
 
     Locally this is a tripwire: a change that edits the runner can edit this gate out of it in
-    the same breath. The boundary that holds is CI, which restores .agentic/ and agentic.toml
-    from the base ref before running, so the judge is never the branch's own copy."""
-    problems, evidence = [], []
+    the same breath. The boundary that holds is CI, which runs the base ref's copy of the runner
+    from outside the working tree, so the judge is never the branch's own copy."""
+    intg = ctx.integrity
+    problems, evidence = list(intg.problems), list(intg.evidence)
     if ctx.tier_override_problem:
         problems.append(ctx.tier_override_problem)
-    if ctx.stage == "commit":
-        change_set = sorted(set(ctx.changed) | set(ctx.vanished))
-    elif ctx.merge_base is None:
-        problems.append("no base ref resolvable: with no change set, neither the policy, the runner "
-                        "nor the tier can be checked against the diff. Fetch the base branch, or pass --base.")
-        change_set = []
-    elif "whole-tree audit" in ctx.changed_mode:
-        evidence.append(f"nothing differs from {ctx.base}: the policy, runner and tier checks are vacuous")
-        change_set = []
-    else:
-        change_set = sorted(set(ctx.changed) | set(ctx.committed) | set(ctx.vanished))
-    protected = sorted(set(f for f in change_set if is_protected(f))
-                       | set(ci_files_running_the_gate(ctx, change_set)))
-    if protected:
-        declared = maintenance_spec(ctx)
+    if intg.protected:
         if ctx.tier != "production":
-            problems.append(f"{protected[:6]}: the policy and the runner may not be changed from a "
+            problems.append(f"{intg.protected[:6]}: the policy and the runner may not be changed from a "
                             f"'{ctx.tier}' branch. Framework maintenance is production work.")
-        elif declared is None:
-            problems.append(f"{protected[:6]}: this change edits the policy, the runner or the CI "
-                            "definition that judges it. "
-                            "If it is deliberate framework maintenance, say so in the spec with a "
-                            "'Framework maintenance: yes' field so that a human reviews it. CI restores "
-                            "both from the base ref before running the gates.")
+        elif intg.declared is None:
+            problems.append(f"{intg.protected[:6]}: this change edits the policy, the runner or the CI "
+                            "definition that judges it. If it is deliberate framework maintenance, say so "
+                            f"with a '{DECLARATION_FIELD}: yes' field in the spec this change references, "
+                            "added or altered in this diff, so that a human reviews it.")
         else:
-            evidence.append(f"declared framework maintenance in {declared}: {protected[:6]}")
-    src = [f for f in change_set if match_any(f, ctx.cfg_get("paths", "source", default=[]))]
-    if src and ctx.tier != "production":
+            evidence.append(f"declared framework maintenance in {intg.declared}: {intg.protected[:6]}")
+    if intg.source and ctx.tier != "production":
         problems.append(f"branch '{ctx.branch}' claims tier '{ctx.tier}', but the change carries production "
-                        f"source: {src[:6]}. A tier that does not run G0, G3 or G5 may not ship source. "
+                        f"source: {intg.source[:6]}. A tier that does not run G0, G3 or G5 may not ship source. "
                         "Move the work to a production branch.")
-    evidence.append(f"change set {len(change_set)} files: {len(protected)} policy or runner, {len(src)} source; "
-                    f"branch '{ctx.branch}' is tier '{ctx.tier}'")
+    evidence.append(f"change set {len(intg.change_set)} files: {len(intg.protected)} policy or runner, "
+                    f"{len(intg.source)} source; branch '{ctx.branch}' is tier '{ctx.tier}'")
     if problems:
-        return _fail("G6", "the change alters what judges it", problems)
+        # the evidence carries why a candidate declaration was rejected, which is the actionable
+        # half of the failure, so it is reported alongside the problems rather than dropped
+        return _fail("G6", "the change alters what judges it", problems + evidence)
     return _pass("G6", evidence)
 
 
@@ -871,6 +1024,8 @@ def run(root: Path, stage: str, base: str | None, tier_override: str | None) -> 
     ctx = Ctx(repo, cfg, stage, base, tier, branch, changed, mode,
               committed=repo.committed_changed_files(base), tier_override_problem=tier_problem,
               vanished=repo.vanished_files(base, stage == "commit"), merge_base=repo.merge_base(base))
+    _ = ctx.integrity   # BEFORE any gate runs. G2 and G3 execute the branch's own commands, so what
+                        # authorises a change to the judge may not be read from state it can write.
     default = [g for g in GATES if g != "G6"]
     required = list(cfg.get("tiers", {}).get("required", {}).get(tier, default))
     if stage == "commit":
@@ -918,9 +1073,17 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(a.root).resolve() if a.root else find_root(Path.cwd().resolve())
     rep = enforce_verdict(run(root, a.stage, a.base, a.tier))
     out_dir = root / ".agentic"
+    report = out_dir / "last-report.json"
     try:
+        # Create or replace the entry; never write through it. A symlink at either path is a
+        # write-through into whatever it points at, and the runner writes this file with the
+        # policy already loaded, so it would not notice overwriting agentic.toml with report JSON.
+        if out_dir.is_symlink() or report.is_symlink():
+            raise OSError(f"{report} or its directory is a symlink: refusing to write the report")
         out_dir.mkdir(exist_ok=True)
-        (out_dir / "last-report.json").write_text(json.dumps(rep, indent=2), encoding="utf-8")
+        tmp = out_dir / ".last-report.json.tmp"
+        tmp.write_text(json.dumps(rep, indent=2), encoding="utf-8")
+        os.replace(tmp, report)
     except OSError:
         pass
     if a.json:
