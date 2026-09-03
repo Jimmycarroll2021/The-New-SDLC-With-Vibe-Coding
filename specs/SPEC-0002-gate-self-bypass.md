@@ -47,6 +47,33 @@ working-tree view catches an agent that has edited the runner but not yet commit
 view is what lets CI restore the policy and the runner from the base ref before running, without
 that restore hiding the very edit it is protecting against.
 
+**Authorisation is resolved from an immutable snapshot, before any branch code runs.** This is the
+correction a second external review forced, and it is one principle rather than a list of patches.
+G6 used to answer "is this change authorised?" by reading mutable state the change itself controls:
+the live filesystem, after G2 and G3 had already executed the branch's own test and eval commands. A
+discovered test that appended `Framework maintenance: yes` to a spec during G2 authorised the very
+runner edit G6 exists to catch, and at commit stage the declaration only had to exist in the
+unstaged copy while the index carried none. So `resolve_integrity()` computes the change set, the
+protected paths and the authorising declaration once, in `run()`, before the first gate is called,
+and `candidate_text()` reads content from the index at commit stage and from the proposed tree in
+CI. Locally the working tree is the candidate, and the ordering is what protects it.
+
+Three conditions now make a declaration valid, each of them necessary. The authorising file has to
+be the spec this change references, so G0 validated the same document the human is asked to read; it
+has to satisfy G0 on its own content, so a one-line unreferenced permit file authorises nothing; and
+the declaration line itself has to appear in this change's diff, so that a cosmetic edit to a spec
+carrying a year-old `yes` is not a renewal.
+
+**The whole of a gate-bearing CI definition is protected, not the lines that name the runner.**
+Fingerprinting only stripped lines containing `gate.py` left the code that establishes trust outside
+the boundary: the revision the workflow picks as its base, the checkout depth, the directory the
+trusted runner is unpacked into, an enclosing `if:`, an injected `PYTHONPATH`, a
+`continue-on-error: true`, a bare `exit 0` before the call. Swapping
+`BASE_SHA="${{ github.event.pull_request.base.sha }}"` for `BASE_SHA="$(git rev-parse HEAD)"` made CI
+archive `.agentic` from the pull request's own head, call it trusted, and run the candidate's runner,
+with every `gate.py` line byte-identical. A definition that never ran the gate is still not protected
+at all; one that did is protected in full.
+
 **The verdict is recomputed from the recorded results.** `verdict()` derives the overall boolean
 from the statuses in the report, and `enforce_verdict()` re-derives it wherever a report is
 produced or consumed: at the end of `run()`, in `main()` before the report is written or printed,
@@ -103,10 +130,26 @@ matters.
     another file type. `--diff-filter=ACMR` with rename detection reports none of those.
 11. A `Framework maintenance: yes` declaration authorises only the change that adds or modifies the
     spec carrying it. A declaration merged earlier is not a standing permission.
-12. A CI definition is protected when the change alters the lines that invoke the runner, and not
-    when it alters something else in the same file, such as a Python or action version.
+12. A CI definition that invoked the runner on the base ref is protected in its entirety. Any
+    difference from the base copy counts, including one that changes no line naming `gate.py`. A
+    definition that did not invoke the runner on the base ref is not protected at all.
 13. A report whose results do not cover the gates it lists as required is not a pass, because
     `all([])` is `True`.
+14. The change set, the protected paths and the authorising declaration are resolved before the
+    first gate runs, so nothing G2 or G3 executes can change them. A test that appends
+    `Framework maintenance: yes` to a spec while the suite runs does not authorise anything.
+15. At commit stage the declaration is read from the index. A declaration present only in the
+    unstaged working copy does not authorise the commit; staging it does.
+16. The authorising file must be a spec this change references and must satisfy G0 on its own
+    content. An unreferenced `specs/permit.md` containing only the field authorises nothing.
+17. The `Framework maintenance` line must be introduced or altered in this change's diff. A
+    cosmetic edit to a spec that already carried the declaration does not renew it.
+18. A whole-tree audit does not discard deletions: a protected file removed from a clean tree on
+    the base branch still fails G6. A base ref that resolves to the candidate's own tip, on any
+    branch other than the project's base branch, fails G6 rather than emptying the diff.
+19. The run-time exemption under `.agentic/` applies to regular files and directories only. A
+    symlink or gitlink at an exempt path is protected, and the runner writes its report by
+    create-and-replace so that it can never be written through such a link.
 
 ## Out of scope
 
@@ -119,9 +162,16 @@ matters.
 - **`paths.ai_surface` in the tier consistency check.** Criterion 4 covers `paths.source` only. An
   AI surface change on an internal branch still skips G3. Narrowing that would fail every ordinary
   documentation branch in this repository, where `AGENTS.md` is itself an AI surface.
-- **`project.base_branch` tampering.** Pointing the base at the branch's own tip degrades the run
-  to a whole-tree audit rather than passing trivially, but it is not detected as tampering. It is
-  an edit to `agentic.toml`, so G6 fails it for that reason instead.
+- **`project.base_branch` tampering.** Pointing the base at the branch's own tip is now refused
+  outright by criterion 18, on any branch that is not the project's base branch, rather than
+  degrading to a vacuous whole-tree audit. Editing the value is separately an edit to
+  `agentic.toml`, so G6 fails it for that reason as well.
+- **Restoring `agentic.toml` from the base ref in CI.** The workflows restore `.agentic/` only; the
+  policy read is deliberately the branch's own, so that a policy change can be exercised by the
+  change proposing it, and the trusted G6 is what stops that change being undeclared. Whether CI
+  should instead judge a policy relaxation by the policy it replaces is a design decision for the
+  repository owner and is not made here. The documentation previously claimed the restore already
+  happened; that claim was wrong and has been corrected rather than implemented.
 - **Gap 4 from the stress test**, that G4 checks an import is declared rather than that it exists,
   and gaps 5 and 6, hollow spec sections and obfuscated secrets. Separate specs, and gap 4 needs a
   human decision about whether the gate is allowed to touch the network or the environment.
@@ -158,8 +208,13 @@ framework is installed. A regression here is not visible in the report it produc
 
 ## Verification
 
-- Criteria 1 to 7: `tests/test_gate.py`, classes `Integrity` and `EndToEnd`, each building a real
-  temporary git repository and asserting the failure mode and the matching pass.
+- Criteria 1 to 7 and 12 to 18: `tests/test_gate.py`, classes `Integrity` and `EndToEnd`, each
+  building a real temporary git repository and asserting the failure mode and the matching pass.
+- Criterion 19: the protection half is tested (`test_g6_treats_a_symlinked_runtime_artefact_as_
+  protected`, which builds the symlink through the git index so it runs on Windows). The write half
+  is tested by `test_the_report_write_does_not_follow_a_symlink`, which **skips** on a host that
+  does not permit creating symlinks, which includes the Windows box this was developed on. It has
+  not been executed. A Linux CI run is what confirms it.
 - Criterion 8: read by eye, plus `git checkout origin/main -- .agentic agentic.toml` exercised by
   hand locally. Not executed in GitHub Actions or Azure Pipelines, because this branch is not
   pushed and the private repository has no runner budget spent on it. A human must confirm the

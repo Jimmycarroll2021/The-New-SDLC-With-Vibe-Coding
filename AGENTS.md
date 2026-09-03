@@ -22,10 +22,11 @@ Rules for any coding agent working in this repository. This file is the single s
 
 - Do not add a skip, force or override flag to any gate. If a gate should not apply, change the tier.
 - Do not weaken a gate to make a change pass. Fix the change.
-- Do not edit `agentic.toml`, anything under `.agentic/`, or the gate step of a CI file, as part of
-  a feature change. G6 fails it, and CI judges with the base ref's runner, not the branch's.
-- Framework maintenance is the exception: a production branch, and a spec **in that same change**
-  saying `Framework maintenance: yes`. Say it in the spec, not in the code.
+- Do not edit `agentic.toml`, anything under `.agentic/`, or any part of a CI file that runs the
+  gate, as part of a feature change. G6 fails it, and CI judges with the base ref's runner.
+- Framework maintenance is the exception: a production branch, and the spec **this change
+  references** carrying a `Framework maintenance: yes` line **added in this diff**. Say it in the
+  spec, not in the code. An older declaration in a file you happen to touch does not count.
 - Do not carry `paths.source` on a prototype or internal branch. That tier does not run G0, G3 or G5.
 - Do not commit secrets, `.env` files, or private keys. The hook blocks them; do not route around it.
 - Do not import a package that is not stdlib, local, or declared in a manifest.
